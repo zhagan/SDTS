@@ -30,6 +30,7 @@ pub fn session_start(
     session_id: &str,
     arena_width_mm: f64,
     arena_height_mm: f64,
+    scenario: &str,
 ) -> Envelope {
     Envelope {
         kind: TYPE_SESSION_START.to_string(),
@@ -39,24 +40,34 @@ pub fn session_start(
             "session_id": session_id,
             "arena_width_mm": arena_width_mm,
             "arena_height_mm": arena_height_mm,
+            "scenario": scenario,
         }),
     }
 }
 
-pub fn target_spawn(time: f64, target_id: &str, radius_mm: f64) -> Envelope {
+pub fn target_spawn(
+    time: f64,
+    target_id: &str,
+    shape: &str,
+    radius_mm: f64,
+    fill: &str,
+    stroke: &str,
+) -> Envelope {
     Envelope {
         kind: TYPE_TARGET_SPAWN.to_string(),
         time,
         source: "core".to_string(),
         data: json!({
             "target_id": target_id,
-            "shape": "circle",
+            "shape": shape,
             "radius_mm": radius_mm,
+            "fill": fill,
+            "stroke": stroke,
         }),
     }
 }
 
-pub fn target_update(time: f64, target_id: &str, x_mm: f64, y_mm: f64) -> Envelope {
+pub fn target_update(time: f64, target_id: &str, x_mm: f64, y_mm: f64, visible: bool) -> Envelope {
     Envelope {
         kind: TYPE_TARGET_UPDATE.to_string(),
         time,
@@ -65,6 +76,7 @@ pub fn target_update(time: f64, target_id: &str, x_mm: f64, y_mm: f64) -> Envelo
             "target_id": target_id,
             "x_mm": x_mm,
             "y_mm": y_mm,
+            "visible": visible,
         }),
     }
 }
@@ -107,7 +119,7 @@ mod tests {
 
     #[test]
     fn envelope_round_trips_with_expected_field_names() {
-        let env = target_update(1.5, "circle-1", 10.0, 20.0);
+        let env = target_update(1.5, "circle-1", 10.0, 20.0, true);
         let line = env.to_line();
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["type"], "target_update");

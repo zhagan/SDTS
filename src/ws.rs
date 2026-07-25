@@ -8,36 +8,42 @@ use futures_util::{SinkExt, StreamExt};
 
 use crate::protocol::{self, Envelope, ImpactData, TYPE_IMPACT};
 use crate::scoring;
-use crate::AppState;
+use crate::{AppState, Session};
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Snapshot whichever session (live or replay) is active right now. A
+    // mode switch that happens later doesn't affect an already-open socket;
+    // the page closes and reopens its connection whenever it switches modes,
+    // which is what picks up the new session.
+    let session = state.current();
+    ws.on_upgrade(move |socket| handle_socket(socket, session))
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(socket: WebSocket, session: Arc<Session>) {
     let (mut sender, mut receiver) = socket.split();
-    let mut rx = state.tx.subscribe();
+    let mut rx = session.tx.subscribe();
 
     // The broadcast channel only carries messages sent after subscribing,
-    // so bootstrap every newly connected renderer directly with the
-    // session/target info it needs (matters for a second live viewer, and
-    // for anyone connecting mid-replay).
+    // so bootstrap the newly connected renderer directly with the
+    // session/target info it needs.
     if sender
-        .send(Message::Text(state.session_start_envelope.to_line()))
+        .send(Message::Text(session.session_start_envelope.to_line()))
         .await
         .is_err()
     {
         return;
     }
-    if sender
-        .send(Message::Text(state.target_spawn_envelope.to_line()))
-        .await
-        .is_err()
-    {
-        return;
+    for envelope in &session.target_spawn_envelopes {
+        if sender
+            .send(Message::Text(envelope.to_line()))
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 
     let mut send_task = tokio::spawn(async move {
@@ -48,13 +54,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    let recv_state = state.clone();
+    let recv_session = session.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
                 if let Ok(env) = serde_json::from_str::<Envelope>(&text) {
                     if env.kind == TYPE_IMPACT {
-                        handle_impact(&recv_state, env).await;
+                        handle_impact(&recv_session, env).await;
                     }
                 }
             }
@@ -70,41 +76,60 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 /// Scores an incoming impact against the Core's authoritative target
 /// position at receipt time (never the client's own idea of where the
 /// target was), then records and broadcasts the result.
-async fn handle_impact(state: &Arc<AppState>, impact_env: Envelope) {
+async fn handle_impact(session: &Arc<Session>, impact_env: Envelope) {
     let data: ImpactData = match serde_json::from_value(impact_env.data.clone()) {
         Ok(d) => d,
         Err(_) => return,
     };
 
-    if let Some(recorder) = &state.recorder {
+    if let Some(recorder) = &session.recorder {
         let mut recorder = recorder.lock().expect("recorder mutex poisoned");
         let _ = recorder.append(&impact_env);
     }
 
     // Replay mode has no live sim to score against — it's a read-only
     // playback of a past session, so clicks during replay are a no-op.
-    let Some(session_start) = state.session_start else {
+    let Some(session_start) = session.session_start else {
         return;
     };
 
     let t_now = Instant::now().duration_since(session_start).as_secs_f64();
-    let target_pos = state.sim.position_at(t_now);
-    let outcome = scoring::evaluate((data.x_mm, data.y_mm), target_pos, state.sim.radius_mm);
+    let Some(scenario) = &session.scenario else {
+        return;
+    };
+    let states = scenario.states_at(t_now);
+    let best = states
+        .iter()
+        .filter(|target| target.visible)
+        .map(|target| {
+            let outcome = scoring::evaluate(
+                (data.x_mm, data.y_mm),
+                (target.x_mm, target.y_mm),
+                target.radius_mm,
+            );
+            (target, outcome)
+        })
+        .min_by(|(_, a), (_, b)| a.distance_mm.total_cmp(&b.distance_mm));
+
+    let (target_id, hit, distance_mm) = match best {
+        Some((target, outcome)) => (target.id.as_str(), outcome.hit, outcome.distance_mm),
+        None => ("", false, f64::INFINITY),
+    };
 
     let result_env = protocol::result(
         t_now,
-        "circle-1",
+        target_id,
         &data.impact_id,
-        outcome.hit,
-        outcome.distance_mm,
+        hit,
+        distance_mm,
         data.x_mm,
         data.y_mm,
     );
 
-    if let Some(recorder) = &state.recorder {
+    if let Some(recorder) = &session.recorder {
         let mut recorder = recorder.lock().expect("recorder mutex poisoned");
         let _ = recorder.append(&result_env);
     }
 
-    let _ = state.tx.send(result_env);
+    let _ = session.tx.send(result_env);
 }

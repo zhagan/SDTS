@@ -1,0 +1,40 @@
+{
+  "name": "Crossing Pair",
+  "description": "Two independently moving targets cross the arena.",
+  "seed": 7,
+  "arena": { "width_mm": 1600, "height_mm": 1000 },
+  "targets": [
+    {
+      "id": "amber",
+      "display": { "shape": "circle", "radius_mm": 65, "fill": "#e3b341", "stroke": "#c99a2e" },
+      "repeat": true,
+      "sequence": [
+        {
+          "action": "show",
+          "duration_secs": 8,
+          "path": {
+            "type": "line",
+            "from": { "x_mm": 100, "y_mm": 300 },
+            "to": { "x_mm": 1500, "y_mm": 700 }
+          }
+        }
+      ]
+    },
+    {
+      "id": "blue",
+      "display": { "shape": "circle", "radius_mm": 65, "fill": "#5aa9e6", "stroke": "#3688c4" },
+      "repeat": true,
+      "sequence": [
+        {
+          "action": "show",
+          "duration_secs": 8,
+          "path": {
+            "type": "line",
+            "from": { "x_mm": 1500, "y_mm": 300 },
+            "to": { "x_mm": 100, "y_mm": 700 }
+          }
+        }
+      ]
+    }
+  ]
+}

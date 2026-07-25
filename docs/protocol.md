@@ -19,6 +19,9 @@ Rules
 -   Immutable events
 -   Unknown fields ignored
 
+`session_start.data.scenario` contains the selected scenario filename for a
+live session. Older recordings may omit it.
+
 ## Impact results
 
 The mouse impact adapter sends the click position in arena coordinates:
@@ -59,3 +62,39 @@ For a `result`, `x_mm` and `y_mm` are the impact coordinates, not the target
 center. Renderers use these coordinates to draw feedback at the location of
 the click. `distance_mm` is the distance between that impact and the target's
 authoritative center at scoring time.
+
+## Target display and visibility
+
+`target_spawn` describes how a renderer should draw a target:
+
+```json
+{
+  "type": "target_spawn",
+  "time": 0,
+  "source": "core",
+  "data": {
+    "target_id": "popup",
+    "shape": "circle",
+    "radius_mm": 75,
+    "fill": "#ef8354",
+    "stroke": "#d9683c"
+  }
+}
+```
+
+`target_update` carries position and visibility. A hidden target must not be
+rendered or considered by scoring.
+
+```json
+{
+  "type": "target_update",
+  "time": 3,
+  "source": "core",
+  "data": {
+    "target_id": "popup",
+    "x_mm": 320.5,
+    "y_mm": 184,
+    "visible": false
+  }
+}
+```

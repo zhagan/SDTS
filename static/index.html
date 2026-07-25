@@ -32,11 +32,101 @@
   .hits b { color: #4caf7d; }
   .misses b { color: #d9534f; }
   .score b { color: #e3b341; }
+
+  #modeTabs { display: flex; gap: 4px; }
+  #modeTabs button {
+    background: #1a2028;
+    color: #8a97a3;
+    border: 1px solid #2c3641;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #modeTabs button.active { color: #e6e9ec; border-color: #4a5a6a; background: #202a34; }
+
+  #modePanel {
+    width: 100%;
+    max-width: 900px;
+    box-sizing: border-box;
+    background: #161b21;
+    border: 1px solid #2c3641;
+    border-radius: 4px;
+    padding: 12px 16px;
+    font-size: 13px;
+  }
+  .hidden { display: none; }
+  #modePanel button {
+    background: #2c3641;
+    color: #e6e9ec;
+    border: 1px solid #3d4b58;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #modePanel button:hover { background: #3d4b58; }
+  #recordPanel { display: flex; align-items: center; gap: 12px; }
+  #scenarioSelect, #speedSelect {
+    background: #1a2028;
+    color: #e6e9ec;
+    border: 1px solid #3d4b58;
+    border-radius: 4px;
+    padding: 5px 8px;
+  }
+  #scenarioDescription { color: #8a97a3; flex: 1; }
+  #replayHeader { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  #recordingList { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+  .recording-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 8px;
+    background: #1a2028;
+    border-radius: 4px;
+  }
+  .recording-row span { color: #b7c1ca; }
+  .recording-actions { display: flex; gap: 6px; }
+  #modePanel button.danger { color: #f19a97; border-color: #713f3d; }
+  #modePanel button.danger:hover { background: #522f2e; }
+  #recordingEmpty { color: #8a97a3; }
 </style>
 </head>
 <body>
   <h1>OpenSDTS — Browser Renderer / Mouse Impact Adapter</h1>
   <div id="status">connecting…</div>
+
+  <div id="modeTabs">
+    <button id="recordTabBtn" class="active">● Record</button>
+    <button id="replayTabBtn">▶ Replay</button>
+  </div>
+
+  <div id="modePanel">
+    <div id="recordPanel">
+      <label>Scenario
+        <select id="scenarioSelect"><option>Loading…</option></select>
+      </label>
+      <button id="startRecordBtn">Start Scenario</button>
+      <span id="scenarioDescription">Loading scenario definitions…</span>
+    </div>
+    <div id="replayPanel" class="hidden">
+      <div id="replayHeader">
+        <button id="refreshRecordingsBtn">Refresh</button>
+        <label style="color:#8a97a3;">Speed
+          <select id="speedSelect">
+            <option value="0.25">0.25x</option>
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+        </label>
+      </div>
+      <div id="recordingList"><span id="recordingEmpty">Loading…</span></div>
+    </div>
+  </div>
+
   <div style="position:relative;">
     <canvas id="arena" width="900" height="562"></canvas>
   </div>
@@ -57,15 +147,29 @@
   const missCountEl = document.getElementById("missCount");
   const scoreTextEl = document.getElementById("scoreText");
   const timeTextEl = document.getElementById("timeText");
+  const hintEl = document.getElementById("hint");
+
+  const recordTabBtn = document.getElementById("recordTabBtn");
+  const replayTabBtn = document.getElementById("replayTabBtn");
+  const recordPanel = document.getElementById("recordPanel");
+  const replayPanel = document.getElementById("replayPanel");
+  const startRecordBtn = document.getElementById("startRecordBtn");
+  const scenarioSelect = document.getElementById("scenarioSelect");
+  const scenarioDescription = document.getElementById("scenarioDescription");
+  const refreshRecordingsBtn = document.getElementById("refreshRecordingsBtn");
+  const recordingListEl = document.getElementById("recordingList");
+  const speedSelect = document.getElementById("speedSelect");
 
   let arenaWidthMm = 0, arenaHeightMm = 0, scale = 1;
-  let targetRadiusMm = 0;
-  let targetMm = { x: 0, y: 0 };
+  let targets = new Map(); // target id -> display, position, and visibility
+  let scenarioDefinitions = [];
+  let activeScenarioFile = null;
   let markers = []; // {xMm, yMm, hit, addedAt}
   let flashes = []; // {hit, addedAt} — big centered HIT/MISS banner
   let sessionId = null;
   let hits = 0, misses = 0;
   let connectedAt = performance.now();
+  let ws = null;
 
   function updateScore() {
     const total = hits + misses;
@@ -88,15 +192,16 @@
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Target.
-    if (targetRadiusMm > 0) {
-      const [tx, ty] = toPx(targetMm.x, targetMm.y);
+    // Active targets.
+    for (const target of targets.values()) {
+      if (!target.visible || target.radiusMm <= 0) continue;
+      const [tx, ty] = toPx(target.xMm, target.yMm);
       ctx.beginPath();
-      ctx.arc(tx, ty, targetRadiusMm * scale, 0, Math.PI * 2);
-      ctx.fillStyle = "#e3b341";
+      ctx.arc(tx, ty, target.radiusMm * scale, 0, Math.PI * 2);
+      ctx.fillStyle = target.fill;
       ctx.fill();
       ctx.lineWidth = 2;
-      ctx.strokeStyle = "#c99a2e";
+      ctx.strokeStyle = target.stroke;
       ctx.stroke();
     }
 
@@ -138,32 +243,68 @@
   }
 
   function connect() {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    if (ws) {
+      ws.onclose = null; // this socket is being deliberately replaced, not lost
+      ws.close();
+    }
 
-    ws.onopen = () => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${proto}://${location.host}/ws`);
+    ws = socket;
+
+    socket.onopen = () => {
       connectedAt = performance.now();
       setStatus("connected", "connected");
     };
 
-    ws.onclose = () => setStatus("disconnected — reload to retry", "disconnected");
-    ws.onerror = () => setStatus("connection error", "disconnected");
+    socket.onclose = () => setStatus("disconnected — reload to retry", "disconnected");
+    socket.onerror = () => setStatus("connection error", "disconnected");
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       const msg = JSON.parse(event.data);
       switch (msg.type) {
         case "session_start":
           sessionId = msg.data.session_id;
           arenaWidthMm = msg.data.arena_width_mm;
           arenaHeightMm = msg.data.arena_height_mm;
+          activeScenarioFile = msg.data.scenario || null;
+          if (activeScenarioFile && scenarioSelect.querySelector(`option[value="${CSS.escape(activeScenarioFile)}"]`)) {
+            scenarioSelect.value = activeScenarioFile;
+            updateScenarioDescription();
+          }
           resizeCanvas();
+          // A new session (fresh recording or a different replay) starts
+          // its own scoreboard rather than carrying over the last one's.
+          hits = 0;
+          misses = 0;
+          markers = [];
+          flashes = [];
+          targets = new Map();
+          hitCountEl.textContent = "0";
+          missCountEl.textContent = "0";
+          updateScore();
           setStatus(`connected — session ${sessionId}`, "connected");
           break;
         case "target_spawn":
-          targetRadiusMm = msg.data.radius_mm;
+          targets.set(msg.data.target_id, {
+            xMm: 0,
+            yMm: 0,
+            visible: false,
+            shape: msg.data.shape || "circle",
+            radiusMm: msg.data.radius_mm,
+            fill: msg.data.fill || "#e3b341",
+            stroke: msg.data.stroke || "#c99a2e",
+          });
           break;
         case "target_update":
-          targetMm = { x: msg.data.x_mm, y: msg.data.y_mm };
+          {
+            const target = targets.get(msg.data.target_id);
+            if (target) {
+              target.xMm = msg.data.x_mm;
+              target.yMm = msg.data.y_mm;
+              target.visible = msg.data.visible !== false;
+            }
+          }
           timeTextEl.textContent = `${msg.time.toFixed(1)}s`;
           break;
         case "result":
@@ -179,26 +320,165 @@
           break;
       }
     };
-
-    canvas.addEventListener("click", (e) => {
-      if (ws.readyState !== WebSocket.OPEN || !arenaWidthMm) return;
-      const rect = canvas.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const py = e.clientY - rect.top;
-      const impact = {
-        type: "impact",
-        time: (performance.now() - connectedAt) / 1000,
-        source: "mouse",
-        data: {
-          impact_id: crypto.randomUUID ? crypto.randomUUID() : String(Math.random()),
-          x_mm: px / scale,
-          y_mm: py / scale,
-        },
-      };
-      ws.send(JSON.stringify(impact));
-    });
   }
 
+  canvas.addEventListener("click", (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !arenaWidthMm) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const impact = {
+      type: "impact",
+      time: (performance.now() - connectedAt) / 1000,
+      source: "mouse",
+      data: {
+        impact_id: crypto.randomUUID ? crypto.randomUUID() : String(Math.random()),
+        x_mm: px / scale,
+        y_mm: py / scale,
+      },
+    };
+    ws.send(JSON.stringify(impact));
+  });
+
+  function setMode(mode) {
+    const isReplay = mode === "replay";
+    recordTabBtn.classList.toggle("active", !isReplay);
+    replayTabBtn.classList.toggle("active", isReplay);
+    recordPanel.classList.toggle("hidden", isReplay);
+    replayPanel.classList.toggle("hidden", !isReplay);
+    hintEl.textContent = isReplay
+      ? "Replay mode — pick a recording below and press Play. Clicks are ignored during playback."
+      : "Click the moving circle. Green = hit, red = miss.";
+    if (isReplay) loadRecordings();
+  }
+
+  async function loadRecordings() {
+    recordingListEl.innerHTML = '<span id="recordingEmpty">Loading…</span>';
+    try {
+      const res = await fetch("/api/recordings");
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const recordings = await res.json();
+      if (recordings.length === 0) {
+        recordingListEl.innerHTML = '<span id="recordingEmpty">No recordings yet.</span>';
+        return;
+      }
+      recordingListEl.innerHTML = "";
+      for (const rec of recordings) {
+        const row = document.createElement("div");
+        row.className = "recording-row";
+
+        const label = document.createElement("span");
+        label.textContent = `${rec.name} (${(rec.size / 1024).toFixed(1)} KB)`;
+
+        const playBtn = document.createElement("button");
+        playBtn.textContent = "▶ Play";
+        playBtn.addEventListener("click", () => startReplay(rec.name));
+
+        const deleteBtn = document.createElement("button");
+        deleteBtn.className = "danger";
+        deleteBtn.textContent = "Delete";
+        deleteBtn.addEventListener("click", () => deleteRecording(rec.name));
+
+        const actions = document.createElement("div");
+        actions.className = "recording-actions";
+        actions.appendChild(playBtn);
+        actions.appendChild(deleteBtn);
+
+        row.appendChild(label);
+        row.appendChild(actions);
+        recordingListEl.appendChild(row);
+      }
+    } catch (err) {
+      recordingListEl.innerHTML = '<span id="recordingEmpty">Failed to load recordings.</span>';
+    }
+  }
+
+  async function deleteRecording(file) {
+    if (!window.confirm(`Delete recording "${file}"? This cannot be undone.`)) return;
+    setStatus(`deleting ${file}…`, "");
+    try {
+      const res = await fetch(`/api/recordings/${encodeURIComponent(file)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setStatus(`deleted ${file}`, "connected");
+      await loadRecordings();
+    } catch (err) {
+      setStatus(`delete failed: ${err.message}`, "disconnected");
+    }
+  }
+
+  async function loadScenarios() {
+    scenarioSelect.innerHTML = '<option>Loading…</option>';
+    try {
+      const res = await fetch("/api/scenarios");
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      scenarioDefinitions = await res.json();
+      scenarioSelect.innerHTML = "";
+      for (const scenario of scenarioDefinitions) {
+        const option = document.createElement("option");
+        option.value = scenario.file;
+        option.textContent = scenario.name;
+        scenarioSelect.appendChild(option);
+      }
+      if (activeScenarioFile && scenarioDefinitions.some((item) => item.file === activeScenarioFile)) {
+        scenarioSelect.value = activeScenarioFile;
+      }
+      if (scenarioDefinitions.length === 0) {
+        scenarioSelect.innerHTML = '<option value="">No scenarios found</option>';
+        startRecordBtn.disabled = true;
+      }
+      updateScenarioDescription();
+    } catch (err) {
+      scenarioSelect.innerHTML = '<option value="">Failed to load</option>';
+      scenarioDescription.textContent = "Could not load scenario definitions.";
+      startRecordBtn.disabled = true;
+    }
+  }
+
+  function updateScenarioDescription() {
+    const selected = scenarioDefinitions.find((item) => item.file === scenarioSelect.value);
+    scenarioDescription.textContent = selected ? selected.description : "";
+  }
+
+  async function startReplay(file) {
+    const speed = parseFloat(speedSelect.value) || 1.0;
+    setStatus("switching to replay…", "");
+    try {
+      const res = await fetch("/api/session/replay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file, speed }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      connect();
+    } catch (err) {
+      setStatus(`replay failed: ${err.message}`, "disconnected");
+    }
+  }
+
+  startRecordBtn.addEventListener("click", async () => {
+    setStatus("starting new recording…", "");
+    try {
+      const res = await fetch("/api/session/record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenario: scenarioSelect.value }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      connect();
+    } catch (err) {
+      setStatus(`failed to start recording: ${err.message}`, "disconnected");
+    }
+  });
+
+  recordTabBtn.addEventListener("click", () => setMode("record"));
+  replayTabBtn.addEventListener("click", () => setMode("replay"));
+  refreshRecordingsBtn.addEventListener("click", loadRecordings);
+  scenarioSelect.addEventListener("change", updateScenarioDescription);
+
+  setMode("record");
+  loadScenarios();
   connect();
   requestAnimationFrame(draw);
 })();

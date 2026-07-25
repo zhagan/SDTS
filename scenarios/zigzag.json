@@ -1,0 +1,30 @@
+{
+  "name": "Zigzag Sweep",
+  "description": "A continuous side-to-side sweep down the arena.",
+  "seed": 1,
+  "arena": { "width_mm": 1600, "height_mm": 1000 },
+  "targets": [
+    {
+      "id": "circle-1",
+      "display": {
+        "shape": "circle",
+        "radius_mm": 75,
+        "fill": "#e3b341",
+        "stroke": "#c99a2e"
+      },
+      "repeat": true,
+      "sequence": [
+        {
+          "action": "show",
+          "duration_secs": 50,
+          "path": {
+            "type": "zigzag",
+            "from": { "x_mm": 100, "y_mm": 100 },
+            "to": { "x_mm": 1500, "y_mm": 900 },
+            "zigzags": 8
+          }
+        }
+      ]
+    }
+  ]
+}

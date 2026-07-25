@@ -34,6 +34,9 @@ The first milestone is intentionally small:
 -   Hit/miss scoring
 -   JSON protocol over WebSocket
 -   Session recording
+-   Declarative target paths and timed sequences
+-   Seeded random positions and delays
+-   Browser scenario selection
 
 No laser hardware is required.
 
@@ -45,3 +48,5 @@ src/
 examples/
 recordings/
 ```
+
+See [docs/index.md](docs/index.md) for the full documentation set.
