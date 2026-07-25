@@ -1,8 +1,5 @@
 mod api;
-mod protocol;
 mod recorder;
-mod scenario;
-mod scoring;
 mod ws;
 
 use std::env;
@@ -16,20 +13,23 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tower_http::services::ServeDir;
 
-use protocol::Envelope;
+use sdts_engine::protocol::{self, Envelope};
+use sdts_engine::scenario::{Scenario, DEFAULT_SCENARIO};
+use sdts_engine::Engine;
+
 use recorder::Recorder;
-use scenario::{Scenario, DEFAULT_SCENARIO};
 
 /// A single point-in-time session: either a live recording session or the
-/// playback of a past recording. In replay mode `recorder` and
-/// `session_start` are `None` — replay is a read-only playback of a past
-/// session, not a new one being recorded.
+/// playback of a past recording. In replay mode `engine`, `file_recorder`,
+/// and `session_start` are `None` — replay is a read-only playback of a
+/// past session (pure SDTP envelope replay), not a new one being recorded
+/// or scored, so it needs none of the engine's live simulation state.
 pub struct Session {
     pub session_start_envelope: Envelope,
     pub target_spawn_envelopes: Vec<Envelope>,
     pub tx: broadcast::Sender<Envelope>,
-    pub recorder: Option<Mutex<Recorder>>,
-    pub scenario: Option<Scenario>,
+    pub file_recorder: Option<Mutex<Recorder>>,
+    pub engine: Option<Mutex<Engine>>,
     pub session_start: Option<Instant>,
 }
 
@@ -102,32 +102,17 @@ async fn main() {
 pub fn spawn_live(state: &Arc<AppState>, scenario_name: &str) -> io::Result<String> {
     let session_id = recorder::new_session_id();
     let scenario = Scenario::load(scenario_name)?;
-    let mut rec = Recorder::new(&session_id)?;
+    let scenario_display_name = scenario.name.clone();
 
-    let session_start_envelope = protocol::session_start(
-        0.0,
-        &session_id,
-        scenario.arena.width_mm,
-        scenario.arena.height_mm,
-        scenario_name,
-    );
-    let target_spawn_envelopes: Vec<_> = scenario
-        .targets
-        .iter()
-        .map(|target| {
-            protocol::target_spawn(
-                0.0,
-                &target.id,
-                &target.display.shape,
-                target.display.radius_mm,
-                &target.display.fill,
-                &target.display.stroke,
-            )
-        })
-        .collect();
-    rec.append(&session_start_envelope)?;
+    let mut engine = Engine::from_scenario(scenario, scenario_name.to_string(), session_id.clone());
+    engine.start();
+    let session_start_envelope = engine.session_start_envelope().clone();
+    let target_spawn_envelopes: Vec<Envelope> = engine.target_spawn_envelopes().to_vec();
+
+    let mut file_recorder = Recorder::new(&session_id)?;
+    file_recorder.append(&session_start_envelope)?;
     for envelope in &target_spawn_envelopes {
-        rec.append(envelope)?;
+        file_recorder.append(envelope)?;
     }
 
     let (tx, _rx) = broadcast::channel(1024);
@@ -135,8 +120,8 @@ pub fn spawn_live(state: &Arc<AppState>, scenario_name: &str) -> io::Result<Stri
         session_start_envelope,
         target_spawn_envelopes,
         tx: tx.clone(),
-        recorder: Some(Mutex::new(rec)),
-        scenario: Some(scenario),
+        file_recorder: Some(Mutex::new(file_recorder)),
+        engine: Some(Mutex::new(engine)),
         session_start: Some(Instant::now()),
     });
 
@@ -148,24 +133,17 @@ pub fn spawn_live(state: &Arc<AppState>, scenario_name: &str) -> io::Result<Stri
         let start = ticker_session
             .session_start
             .expect("live session always has a start time");
+        let engine = ticker_session
+            .engine
+            .as_ref()
+            .expect("live session always has an engine");
         let mut ticker = tokio::time::interval(Duration::from_millis(16));
         loop {
             ticker.tick().await;
             let t = Instant::now().duration_since(start).as_secs_f64();
-            let states = ticker_session
-                .scenario
-                .as_ref()
-                .expect("live session always has a scenario")
-                .states_at(t);
-            for target in states {
-                let env = protocol::target_update(
-                    t,
-                    &target.id,
-                    target.x_mm,
-                    target.y_mm,
-                    target.visible,
-                );
-                if let Some(recorder) = &ticker_session.recorder {
+            let envelopes = engine.lock().expect("engine mutex poisoned").update(t);
+            for env in envelopes {
+                if let Some(recorder) = &ticker_session.file_recorder {
                     let mut recorder = recorder.lock().expect("recorder mutex poisoned");
                     let _ = recorder.append(&env);
                 }
@@ -175,8 +153,7 @@ pub fn spawn_live(state: &Arc<AppState>, scenario_name: &str) -> io::Result<Stri
     });
 
     println!(
-        "Recording scenario '{}' as session {session_id} to recordings/{session_id}.jsonl",
-        ticker_session_name(&session)
+        "Recording scenario '{scenario_display_name}' as session {session_id} to recordings/{session_id}.jsonl"
     );
     state.replace(session, task);
     Ok(session_id)
@@ -187,7 +164,8 @@ pub fn spawn_live(state: &Arc<AppState>, scenario_name: &str) -> io::Result<Stri
 /// speed (twice as slow), `2.0` is double speed. Only the wall-clock gap
 /// between messages is scaled — recorded `time` values are untouched, so
 /// the on-screen clock still reads the original session time, just paced
-/// out more slowly.
+/// out more slowly. Replay is a pure SDTP envelope playback: no scenario is
+/// re-evaluated and no scoring happens, so it needs no `Engine` at all.
 pub fn spawn_replay(state: &Arc<AppState>, path: &str, speed: f64) -> io::Result<()> {
     let contents = std::fs::read_to_string(path)?;
     let recorded: Vec<Envelope> = contents
@@ -216,8 +194,8 @@ pub fn spawn_replay(state: &Arc<AppState>, path: &str, speed: f64) -> io::Result
         session_start_envelope,
         target_spawn_envelopes,
         tx: tx.clone(),
-        recorder: None,
-        scenario: None,
+        file_recorder: None,
+        engine: None,
         session_start: None,
     });
 
@@ -243,12 +221,4 @@ pub fn spawn_replay(state: &Arc<AppState>, path: &str, speed: f64) -> io::Result
 
     state.replace(session, task);
     Ok(())
-}
-
-fn ticker_session_name(session: &Session) -> &str {
-    session
-        .scenario
-        .as_ref()
-        .map(|scenario| scenario.name.as_str())
-        .unwrap_or("replay")
 }

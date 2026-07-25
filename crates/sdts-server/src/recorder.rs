@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::Envelope;
+use sdts_engine::protocol::Envelope;
 
 /// Appends every SDTP message for a session as one JSON line to
 /// `recordings/<session_id>.jsonl`. Append-only, matching the "immutable

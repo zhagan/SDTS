@@ -496,7 +496,7 @@ mod tests {
     use super::*;
 
     fn popup() -> Scenario {
-        serde_json::from_str(include_str!("../scenarios/random-popup.json")).unwrap()
+        serde_json::from_str(include_str!("../../../scenarios/random-popup.json")).unwrap()
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn multiple_targets_are_evaluated_independently() {
         let scenario: Scenario =
-            serde_json::from_str(include_str!("../scenarios/crossing-pair.json")).unwrap();
+            serde_json::from_str(include_str!("../../../scenarios/crossing-pair.json")).unwrap();
         let states = scenario.states_at(4.0);
         assert_eq!(states.len(), 2);
         assert!(states.iter().all(|target| target.visible));
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn random_line_is_deterministic_and_stays_inside_the_arena() {
         let scenario: Scenario =
-            serde_json::from_str(include_str!("../scenarios/random-dash.json")).unwrap();
+            serde_json::from_str(include_str!("../../../scenarios/random-dash.json")).unwrap();
         let first = &scenario.states_at(1.5)[0];
         let again = &scenario.states_at(1.5)[0];
         assert_eq!(first.x_mm, again.x_mm);

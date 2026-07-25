@@ -6,7 +6,8 @@ use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::scenario::{safe_scenario_name, Scenario, DEFAULT_SCENARIO, SCENARIOS_DIR};
+use sdts_engine::scenario::{safe_scenario_name, Scenario, DEFAULT_SCENARIO, SCENARIOS_DIR};
+
 use crate::AppState;
 
 const RECORDINGS_DIR: &str = "recordings";

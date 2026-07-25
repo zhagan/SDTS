@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenSDTS — Browser WASM Demo</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23e3b341' stroke='%23c99a2e' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23101418'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>OpenSDTS — Browser WASM Demo</h1>
+    <p class="tagline">
+      The real OpenSDTS Rust engine — scenario evaluation, scoring, recording,
+      and replay — compiled to WebAssembly and running entirely in this page.
+      No server, no backend.
+    </p>
+  </header>
+
+  <div id="status" class="ready">loading engine…</div>
+
+  <div id="controls">
+    <div class="control-row">
+      <label>Scenario
+        <select id="scenarioSelect" disabled><option>Loading…</option></select>
+      </label>
+      <button id="startBtn" class="primary" disabled>Start / Restart</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <span id="scenarioDescription">Loading scenario definitions…</span>
+    </div>
+    <div class="control-row">
+      <button id="replayBtn" disabled>▶ Replay</button>
+      <button id="exportBtn" disabled>Export Recording</button>
+      <label>Import Recording
+        <input type="file" id="importInput" accept=".jsonl,.json,application/json" />
+      </label>
+    </div>
+  </div>
+
+  <div id="arenaWrap">
+    <canvas id="arena" width="900" height="562"></canvas>
+  </div>
+
+  <div id="stats">
+    <span id="time">Time: <b id="timeText">0.0s</b></span>
+    <span class="hits">Hits: <b id="hitCount">0</b></span>
+    <span class="misses">Misses: <b id="missCount">0</b></span>
+    <span class="score">Score: <b id="scoreText">0/0</b></span>
+  </div>
+  <div id="hint">Select a scenario and press Start. Click the target — green ring = hit, red ring = miss.</div>
+
+  <div id="localRecordings">
+    <h2>
+      Local Recordings
+      <button id="clearLocalBtn" class="danger">Clear Local Recordings</button>
+    </h2>
+    <div id="localRecordingList"><span id="recordingEmpty">No local recordings yet — export one to save it here.</span></div>
+  </div>
+
+  <footer>
+    Part of <a href="index.md">OpenSDTS</a> — the native server + browser
+    renderer/impact-adapter share this same engine. See
+    <a href="index.md">docs/index.md</a> for how it all fits together.
+  </footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

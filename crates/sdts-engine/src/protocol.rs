@@ -81,6 +81,19 @@ pub fn target_update(time: f64, target_id: &str, x_mm: f64, y_mm: f64, visible: 
     }
 }
 
+pub fn impact(time: f64, source: &str, impact_id: &str, x_mm: f64, y_mm: f64) -> Envelope {
+    Envelope {
+        kind: TYPE_IMPACT.to_string(),
+        time,
+        source: source.to_string(),
+        data: json!({
+            "impact_id": impact_id,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+        }),
+    }
+}
+
 pub fn result(
     time: f64,
     target_id: &str,

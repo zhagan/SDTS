@@ -1,0 +1,15 @@
+{
+  "name": "sdts-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "sdts_wasm_bg.wasm",
+    "sdts_wasm.js",
+    "sdts_wasm.d.ts"
+  ],
+  "main": "sdts_wasm.js",
+  "types": "sdts_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

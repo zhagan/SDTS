@@ -6,8 +6,8 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 
-use crate::protocol::{self, Envelope, ImpactData, TYPE_IMPACT};
-use crate::scoring;
+use sdts_engine::protocol::{self, Envelope, ImpactData, TYPE_IMPACT};
+
 use crate::{AppState, Session};
 
 pub async fn ws_handler(
@@ -75,14 +75,16 @@ async fn handle_socket(socket: WebSocket, session: Arc<Session>) {
 
 /// Scores an incoming impact against the Core's authoritative target
 /// position at receipt time (never the client's own idea of where the
-/// target was), then records and broadcasts the result.
+/// target was), then records and broadcasts the result. All scoring logic
+/// lives in `sdts_engine::Engine::impact` so it's shared byte-for-byte with
+/// the WASM browser build.
 async fn handle_impact(session: &Arc<Session>, impact_env: Envelope) {
     let data: ImpactData = match serde_json::from_value(impact_env.data.clone()) {
         Ok(d) => d,
         Err(_) => return,
     };
 
-    if let Some(recorder) = &session.recorder {
+    if let Some(recorder) = &session.file_recorder {
         let mut recorder = recorder.lock().expect("recorder mutex poisoned");
         let _ = recorder.append(&impact_env);
     }
@@ -92,41 +94,27 @@ async fn handle_impact(session: &Arc<Session>, impact_env: Envelope) {
     let Some(session_start) = session.session_start else {
         return;
     };
-
-    let t_now = Instant::now().duration_since(session_start).as_secs_f64();
-    let Some(scenario) = &session.scenario else {
+    let Some(engine) = &session.engine else {
         return;
     };
-    let states = scenario.states_at(t_now);
-    let best = states
-        .iter()
-        .filter(|target| target.visible)
-        .map(|target| {
-            let outcome = scoring::evaluate(
-                (data.x_mm, data.y_mm),
-                (target.x_mm, target.y_mm),
-                target.radius_mm,
-            );
-            (target, outcome)
-        })
-        .min_by(|(_, a), (_, b)| a.distance_mm.total_cmp(&b.distance_mm));
 
-    let (target_id, hit, distance_mm) = match best {
-        Some((target, outcome)) => (target.id.as_str(), outcome.hit, outcome.distance_mm),
-        None => ("", false, f64::INFINITY),
-    };
+    let t_now = Instant::now().duration_since(session_start).as_secs_f64();
+    let outcome = engine
+        .lock()
+        .expect("engine mutex poisoned")
+        .impact(t_now, &data.impact_id, data.x_mm, data.y_mm);
 
     let result_env = protocol::result(
-        t_now,
-        target_id,
-        &data.impact_id,
-        hit,
-        distance_mm,
-        data.x_mm,
-        data.y_mm,
+        outcome.time,
+        &outcome.target_id,
+        &outcome.impact_id,
+        outcome.hit,
+        outcome.distance_mm,
+        outcome.x_mm,
+        outcome.y_mm,
     );
 
-    if let Some(recorder) = &session.recorder {
+    if let Some(recorder) = &session.file_recorder {
         let mut recorder = recorder.lock().expect("recorder mutex poisoned");
         let _ = recorder.append(&result_env);
     }

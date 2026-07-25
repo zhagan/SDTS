@@ -1,0 +1,41 @@
+{
+  "name": "Random Dash",
+  "description": "Appears randomly, moves in a random direction, disappears, and repeats.",
+  "seed": 93,
+  "arena": { "width_mm": 1600, "height_mm": 1000 },
+  "targets": [
+    {
+      "id": "dash",
+      "display": {
+        "shape": "circle",
+        "radius_mm": 75,
+        "fill": "#9bdeac",
+        "stroke": "#62b676"
+      },
+      "repeat": true,
+      "sequence": [
+        {
+          "action": "show",
+          "duration_secs": 3,
+          "path": {
+            "type": "random_line",
+            "margin_mm": 25,
+            "distance_mm": {
+              "min": 350,
+              "max": 900
+            }
+          }
+        },
+        {
+          "action": "hide",
+          "duration_secs": {
+            "random": {
+              "min": 1,
+              "max": 3
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
