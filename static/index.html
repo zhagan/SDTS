@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>OpenSDTS — Browser Renderer POC</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: #101418;
+    color: #e6e9ec;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; }
+  #status { font-size: 13px; color: #8a97a3; }
+  #status.connected { color: #4caf7d; }
+  #status.disconnected { color: #d9534f; }
+  canvas {
+    background: #1a2028;
+    border: 1px solid #2c3641;
+    border-radius: 4px;
+    cursor: crosshair;
+  }
+  #stats { display: flex; gap: 24px; font-size: 14px; }
+  #stats span b { font-variant-numeric: tabular-nums; }
+  #time b { font-variant-numeric: tabular-nums; }
+  .hits b { color: #4caf7d; }
+  .misses b { color: #d9534f; }
+  .score b { color: #e3b341; }
+</style>
+</head>
+<body>
+  <h1>OpenSDTS — Browser Renderer / Mouse Impact Adapter</h1>
+  <div id="status">connecting…</div>
+  <div style="position:relative;">
+    <canvas id="arena" width="900" height="562"></canvas>
+  </div>
+  <div id="stats">
+    <span id="time">Time: <b id="timeText">0.0s</b></span>
+    <span class="hits">Hits: <b id="hitCount">0</b></span>
+    <span class="misses">Misses: <b id="missCount">0</b></span>
+    <span class="score">Score: <b id="scoreText">0/0</b></span>
+  </div>
+  <div id="hint" style="font-size:12px;color:#8a97a3;">Click the moving circle. Green = hit, red = miss.</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("arena");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const hitCountEl = document.getElementById("hitCount");
+  const missCountEl = document.getElementById("missCount");
+  const scoreTextEl = document.getElementById("scoreText");
+  const timeTextEl = document.getElementById("timeText");
+
+  let arenaWidthMm = 0, arenaHeightMm = 0, scale = 1;
+  let targetRadiusMm = 0;
+  let targetMm = { x: 0, y: 0 };
+  let markers = []; // {xMm, yMm, hit, addedAt}
+  let flashes = []; // {hit, addedAt} — big centered HIT/MISS banner
+  let sessionId = null;
+  let hits = 0, misses = 0;
+  let connectedAt = performance.now();
+
+  function updateScore() {
+    const total = hits + misses;
+    const pct = total > 0 ? ` (${Math.round((100 * hits) / total)}%)` : "";
+    scoreTextEl.textContent = `${hits}/${total}${pct}`;
+  }
+
+  function resizeCanvas() {
+    if (!arenaWidthMm || !arenaHeightMm) return;
+    const desiredWidthPx = 900;
+    scale = desiredWidthPx / arenaWidthMm;
+    canvas.width = Math.round(arenaWidthMm * scale);
+    canvas.height = Math.round(arenaHeightMm * scale);
+  }
+
+  function toPx(xMm, yMm) {
+    return [xMm * scale, yMm * scale];
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Target.
+    if (targetRadiusMm > 0) {
+      const [tx, ty] = toPx(targetMm.x, targetMm.y);
+      ctx.beginPath();
+      ctx.arc(tx, ty, targetRadiusMm * scale, 0, Math.PI * 2);
+      ctx.fillStyle = "#e3b341";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#c99a2e";
+      ctx.stroke();
+    }
+
+    // Impact markers, fading out after ~1.2s.
+    const now = performance.now();
+    markers = markers.filter((m) => now - m.addedAt < 1200);
+    for (const m of markers) {
+      const [mx, my] = toPx(m.xMm, m.yMm);
+      const age = (now - m.addedAt) / 1200;
+      ctx.globalAlpha = 1 - age;
+      ctx.beginPath();
+      ctx.arc(mx, my, 8, 0, Math.PI * 2);
+      ctx.strokeStyle = m.hit ? "#4caf7d" : "#d9534f";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // Big centered HIT/MISS banner, fading out after ~800ms.
+    flashes = flashes.filter((f) => now - f.addedAt < 800);
+    const flash = flashes[flashes.length - 1];
+    if (flash) {
+      const age = (now - flash.addedAt) / 800;
+      ctx.globalAlpha = 1 - age;
+      ctx.font = "bold 48px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = flash.hit ? "#4caf7d" : "#d9534f";
+      ctx.fillText(flash.hit ? "HIT" : "MISS", canvas.width / 2, canvas.height / 2);
+      ctx.globalAlpha = 1;
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls;
+  }
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      connectedAt = performance.now();
+      setStatus("connected", "connected");
+    };
+
+    ws.onclose = () => setStatus("disconnected — reload to retry", "disconnected");
+    ws.onerror = () => setStatus("connection error", "disconnected");
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      switch (msg.type) {
+        case "session_start":
+          sessionId = msg.data.session_id;
+          arenaWidthMm = msg.data.arena_width_mm;
+          arenaHeightMm = msg.data.arena_height_mm;
+          resizeCanvas();
+          setStatus(`connected — session ${sessionId}`, "connected");
+          break;
+        case "target_spawn":
+          targetRadiusMm = msg.data.radius_mm;
+          break;
+        case "target_update":
+          targetMm = { x: msg.data.x_mm, y: msg.data.y_mm };
+          timeTextEl.textContent = `${msg.time.toFixed(1)}s`;
+          break;
+        case "result":
+          markers.push({ xMm: msg.data.x_mm, yMm: msg.data.y_mm, hit: msg.data.hit, addedAt: performance.now() });
+          flashes.push({ hit: msg.data.hit, addedAt: performance.now() });
+          if (msg.data.hit) hits++; else misses++;
+          hitCountEl.textContent = hits;
+          missCountEl.textContent = misses;
+          updateScore();
+          break;
+        default:
+          // Unknown message types are ignored, per SDTP forward-compat rule.
+          break;
+      }
+    };
+
+    canvas.addEventListener("click", (e) => {
+      if (ws.readyState !== WebSocket.OPEN || !arenaWidthMm) return;
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      const impact = {
+        type: "impact",
+        time: (performance.now() - connectedAt) / 1000,
+        source: "mouse",
+        data: {
+          impact_id: crypto.randomUUID ? crypto.randomUUID() : String(Math.random()),
+          x_mm: px / scale,
+          y_mm: py / scale,
+        },
+      };
+      ws.send(JSON.stringify(impact));
+    });
+  }
+
+  connect();
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
