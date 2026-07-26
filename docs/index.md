@@ -57,9 +57,11 @@ make build      # both of the above
 
 Requires `wasm-pack` and the `wasm32-unknown-unknown` target
 (`rustup target add wasm32-unknown-unknown`). `docs/pkg/` and
-`docs/scenarios/` are checked into the repo so GitHub Pages can serve them
-as static files with no build step at deploy time — re-run `make build`
-and commit the results whenever the engine or scenarios change.
+`docs/scenarios/*.json` are generated output (gitignored, not checked
+in) — `scenarios/*.json` and `crates/sdts-wasm` are the source of truth.
+Run `make build` locally when you want to `make serve` and preview the
+demo; deployment builds fresh in CI (see below), so there's nothing to
+commit here.
 
 ### Running it locally
 
@@ -74,9 +76,12 @@ the same files work unmodified from a local static server or from
 
 ### Publishing via GitHub Pages
 
-1. Run `make build` and commit the resulting `docs/pkg/` and
-   `docs/scenarios/` changes.
-2. Push to `main`.
+[`.github/workflows/pages.yml`](../.github/workflows/pages.yml) runs
+`make build` and deploys `docs/` on every push to `main` that touches
+`crates/`, `scenarios/`, `docs/`, `static/`, or the build scripts —
+publishing is automatic, nothing to build or commit locally. The repo's
+Pages source must be set to "GitHub Actions" (Settings → Pages) for the
+workflow to publish.
 3. In the GitHub repo, open **Settings → Pages**.
 4. Under **Build and deployment**, select **Deploy from a branch**.
 5. Set branch to `main`, folder to `/docs`, and **Save**.

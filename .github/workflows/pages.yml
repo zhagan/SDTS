@@ -1,0 +1,64 @@
+name: Deploy GitHub Pages
+
+# Builds the browser WASM demo (crates/sdts-wasm -> docs/pkg, scenarios/ ->
+# docs/scenarios) and publishes docs/ to GitHub Pages. This is the only
+# place those generated files are produced for deployment — they are not
+# committed to the repo (see .gitignore), so scenarios/ and crates/sdts-wasm
+# stay the single source of truth instead of drifting out of sync with
+# hand-copied files under docs/.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "scenarios/**"
+      - "docs/**"
+      - "static/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "scripts/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Build WASM demo + scenario manifest
+        run: make build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

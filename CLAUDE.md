@@ -20,7 +20,11 @@ breakdown, and `README.md` for the live demo URL.
 - Run the native server (live recording, default): `cargo run -p sdts-server` — serves on http://127.0.0.1:3000
 - Run the native server (replay a specific file from the CLI): `cargo run -p sdts-server -- replay recordings/<file>.jsonl [speed]`
 - Build/rebuild the browser WASM demo: `make build` (or `make wasm` +
-  `make scenarios` separately); serve it locally with `make serve`
+  `make scenarios` separately); serve it locally with `make serve`. Output
+  (`docs/pkg/`, `docs/scenarios/*.json`) is gitignored — `scenarios/` and
+  `crates/sdts-wasm` are the source of truth, and
+  `.github/workflows/pages.yml` rebuilds and deploys `docs/` on every
+  push to `main`, so there's nothing to commit after a local build.
 - Verify the WASM engine also compiles standalone: `cargo build -p sdts-engine --target wasm32-unknown-unknown`
 
 The native server's active session (live recording vs. replaying a past
