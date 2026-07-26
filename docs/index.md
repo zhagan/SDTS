@@ -1,6 +1,9 @@
 # OpenSDTS Docs
 
-- [Demo video](demo_video/sdts-demo.mov) — a recorded walkthrough of the browser demo in action.
+- [Demo video](demo_video/sdts-demo.mp4) — a recorded walkthrough of the browser demo in action.
+
+  <video src="demo_video/sdts-demo.mp4" controls width="640"></video>
+
 - [Architecture](architecture.md) — components and how they fit together (Core, Renderer, Impact Adapter, Scoring, Recorder).
 - [Components](components.md) — responsibilities of each component.
 - [Protocol (SDTP)](protocol.md) — the WebSocket/JSON message envelope shared by every component.

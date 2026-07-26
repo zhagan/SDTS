@@ -42,6 +42,23 @@ h1 {
   margin: 6px 0 0;
 }
 
+#demoVideo {
+  width: 100%;
+  max-width: 900px;
+}
+#demoVideo summary {
+  cursor: pointer;
+  color: #8a97a3;
+  font-size: 13px;
+}
+#demoVideo video {
+  display: block;
+  width: 100%;
+  max-width: 640px;
+  margin: 10px auto 0;
+  border-radius: 6px;
+}
+
 #status {
   font-size: 13px;
   color: #8a97a3;
