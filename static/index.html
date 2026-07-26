@@ -303,6 +303,7 @@
               target.xMm = msg.data.x_mm;
               target.yMm = msg.data.y_mm;
               target.visible = msg.data.visible !== false;
+              if (msg.data.radius_mm !== undefined) target.radiusMm = msg.data.radius_mm;
             }
           }
           timeTextEl.textContent = `${msg.time.toFixed(1)}s`;

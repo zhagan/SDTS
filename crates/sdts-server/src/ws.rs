@@ -112,6 +112,7 @@ async fn handle_impact(session: &Arc<Session>, impact_env: Envelope) {
         outcome.distance_mm,
         outcome.x_mm,
         outcome.y_mm,
+        outcome.hits_remaining,
     );
 
     if let Some(recorder) = &session.file_recorder {

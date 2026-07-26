@@ -31,6 +31,27 @@ pub struct TargetDefinition {
     #[serde(default = "default_true")]
     pub repeat: bool,
     pub sequence: Vec<Step>,
+    /// If present, this target can be shot down: it tracks hits across its
+    /// current appearance and is destroyed once `hits_to_destroy` land. If
+    /// absent, the target is indestructible and constant-sized (today's
+    /// behavior) — hits never affect its size or lifetime.
+    #[serde(default)]
+    pub durability: Option<Durability>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Durability {
+    pub hits_to_destroy: u32,
+    /// Radius multiplier applied after each hit that doesn't destroy the
+    /// target (e.g. `0.85` shrinks it 15% per hit). Defaults to `1.0` (no
+    /// shrink — the target just takes `hits_to_destroy` hits at a constant
+    /// size before disappearing).
+    #[serde(default = "default_shrink_per_hit")]
+    pub shrink_per_hit: f64,
+    /// Floor for shrinking, as a fraction of the target's base radius, so
+    /// repeated hits can't shrink it into an unhittable point.
+    #[serde(default = "default_min_radius_factor")]
+    pub min_radius_factor: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +149,18 @@ pub struct TargetState {
     pub y_mm: f64,
     pub radius_mm: f64,
     pub visible: bool,
+    /// Identifies the current appearance ("life") of the target: bumps
+    /// whenever the sequence moves into a different step, either by normal
+    /// timed progression or because the engine force-skipped a step early
+    /// (destroying it). Callers that track hit-count/size state per target
+    /// use a change here to know when to reset that state.
+    pub cycle: u64,
+    pub step_index: usize,
+    /// Seconds remaining before this step ends on its own. Used by the
+    /// engine to compute how far to fast-forward a target's local clock
+    /// when it's destroyed early, so it skips cleanly to whatever comes
+    /// next in its own sequence instead of waiting out the timer.
+    pub remaining_in_step_secs: f64,
 }
 
 impl Scenario {
@@ -151,6 +184,17 @@ impl Scenario {
             if target.id.is_empty() || target.sequence.is_empty() || target.display.radius_mm <= 0.0
             {
                 return invalid("targets require an id, positive radius, and non-empty sequence");
+            }
+            if let Some(durability) = &target.durability {
+                if durability.hits_to_destroy == 0 {
+                    return invalid("durability.hits_to_destroy must be at least 1");
+                }
+                if durability.shrink_per_hit <= 0.0 || durability.shrink_per_hit > 1.0 {
+                    return invalid("durability.shrink_per_hit must be in (0.0, 1.0]");
+                }
+                if durability.min_radius_factor <= 0.0 || durability.min_radius_factor > 1.0 {
+                    return invalid("durability.min_radius_factor must be in (0.0, 1.0]");
+                }
             }
             for step in &target.sequence {
                 let duration = match step {
@@ -186,7 +230,13 @@ impl Scenario {
             .collect()
     }
 
-    fn target_state_at(&self, target: &TargetDefinition, mut remaining: f64) -> TargetState {
+    /// Evaluates a single target's state at `t` seconds along *its own*
+    /// local clock. `states_at` calls this with the same global `t` for
+    /// every target; the engine calls it directly with a per-target local
+    /// time (global time plus that target's accumulated skip-ahead offset)
+    /// so a destroyed target's clock can jump independently of the others.
+    pub fn target_state_at(&self, target: &TargetDefinition, t: f64) -> TargetState {
+        let mut remaining = t.max(0.0);
         let mut cycle = 0_u64;
         let mut previous = Point {
             x_mm: self.arena.width_mm / 2.0,
@@ -220,6 +270,9 @@ impl Scenario {
                         y_mm: point.y_mm,
                         radius_mm: target.display.radius_mm,
                         visible: matches!(step, Step::Show { .. }),
+                        cycle,
+                        step_index,
+                        remaining_in_step_secs: duration - remaining,
                     };
                 }
                 remaining -= duration;
@@ -234,6 +287,9 @@ impl Scenario {
                     y_mm: previous.y_mm,
                     radius_mm: target.display.radius_mm,
                     visible: false,
+                    cycle,
+                    step_index: target.sequence.len(),
+                    remaining_in_step_secs: 0.0,
                 };
             }
             cycle += 1;
@@ -490,6 +546,12 @@ fn default_stroke() -> String {
 fn default_zigzags() -> u32 {
     6
 }
+fn default_shrink_per_hit() -> f64 {
+    1.0
+}
+fn default_min_radius_factor() -> f64 {
+    0.35
+}
 
 #[cfg(test)]
 mod tests {
@@ -576,5 +638,47 @@ mod tests {
         assert!(first.y_mm >= first.radius_mm);
         assert!(first.y_mm <= scenario.arena.height_mm - first.radius_mm);
         assert!(!scenario.states_at(3.5)[0].visible);
+    }
+
+    #[test]
+    fn gallery_scenario_parses_and_validates() {
+        let scenario: Scenario =
+            serde_json::from_str(include_str!("../../../scenarios/gallery.json")).unwrap();
+        scenario.validate().unwrap();
+        let durability = scenario.targets[0].durability.as_ref().unwrap();
+        assert_eq!(durability.hits_to_destroy, 3);
+    }
+
+    #[test]
+    fn validate_rejects_zero_hits_to_destroy() {
+        let mut scenario = popup();
+        scenario.targets[0].durability = Some(Durability {
+            hits_to_destroy: 0,
+            shrink_per_hit: 1.0,
+            min_radius_factor: 0.35,
+        });
+        assert!(scenario.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_shrink_per_hit() {
+        let mut scenario = popup();
+        scenario.targets[0].durability = Some(Durability {
+            hits_to_destroy: 3,
+            shrink_per_hit: 1.5,
+            min_radius_factor: 0.35,
+        });
+        assert!(scenario.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_min_radius_factor() {
+        let mut scenario = popup();
+        scenario.targets[0].durability = Some(Durability {
+            hits_to_destroy: 3,
+            shrink_per_hit: 0.8,
+            min_radius_factor: 0.0,
+        });
+        assert!(scenario.validate().is_err());
     }
 }

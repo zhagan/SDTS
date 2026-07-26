@@ -67,7 +67,14 @@ pub fn target_spawn(
     }
 }
 
-pub fn target_update(time: f64, target_id: &str, x_mm: f64, y_mm: f64, visible: bool) -> Envelope {
+pub fn target_update(
+    time: f64,
+    target_id: &str,
+    x_mm: f64,
+    y_mm: f64,
+    visible: bool,
+    radius_mm: f64,
+) -> Envelope {
     Envelope {
         kind: TYPE_TARGET_UPDATE.to_string(),
         time,
@@ -77,6 +84,7 @@ pub fn target_update(time: f64, target_id: &str, x_mm: f64, y_mm: f64, visible: 
             "x_mm": x_mm,
             "y_mm": y_mm,
             "visible": visible,
+            "radius_mm": radius_mm,
         }),
     }
 }
@@ -94,6 +102,9 @@ pub fn impact(time: f64, source: &str, impact_id: &str, x_mm: f64, y_mm: f64) ->
     }
 }
 
+/// `hits_remaining` is `Some(n)` when the target hit has a `durability`
+/// budget (n counts down to 0, at which point the target is destroyed and
+/// respawns), or `None` for an indestructible target or a miss.
 pub fn result(
     time: f64,
     target_id: &str,
@@ -102,6 +113,7 @@ pub fn result(
     distance_mm: f64,
     impact_x_mm: f64,
     impact_y_mm: f64,
+    hits_remaining: Option<u32>,
 ) -> Envelope {
     Envelope {
         kind: TYPE_RESULT.to_string(),
@@ -114,6 +126,7 @@ pub fn result(
             "distance_mm": distance_mm,
             "x_mm": impact_x_mm,
             "y_mm": impact_y_mm,
+            "hits_remaining": hits_remaining,
         }),
     }
 }
@@ -132,7 +145,7 @@ mod tests {
 
     #[test]
     fn envelope_round_trips_with_expected_field_names() {
-        let env = target_update(1.5, "circle-1", 10.0, 20.0, true);
+        let env = target_update(1.5, "circle-1", 10.0, 20.0, true, 75.0);
         let line = env.to_line();
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["type"], "target_update");
@@ -151,8 +164,9 @@ mod tests {
 
     #[test]
     fn result_contains_impact_coordinates() {
-        let env = result(1.5, "circle-1", "impact-1", true, 5.0, 110.0, 220.0);
+        let env = result(1.5, "circle-1", "impact-1", true, 5.0, 110.0, 220.0, Some(2));
         assert_eq!(env.data["x_mm"], 110.0);
         assert_eq!(env.data["y_mm"], 220.0);
+        assert_eq!(env.data["hits_remaining"], 2);
     }
 }

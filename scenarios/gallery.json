@@ -1,0 +1,34 @@
+{
+  "name": "Gallery",
+  "description": "A target that takes 3 hits to destroy, shrinking each hit — a fresh one appears elsewhere in the arena the instant it's destroyed.",
+  "seed": 21,
+  "arena": { "width_mm": 1600, "height_mm": 1000 },
+  "targets": [
+    {
+      "id": "gallery-1",
+      "display": {
+        "shape": "circle",
+        "radius_mm": 90,
+        "fill": "#c77dff",
+        "stroke": "#9d4edd"
+      },
+      "repeat": true,
+      "durability": {
+        "hits_to_destroy": 3,
+        "shrink_per_hit": 0.75,
+        "min_radius_factor": 0.4
+      },
+      "sequence": [
+        {
+          "action": "show",
+          "duration_secs": 60,
+          "position": {
+            "type": "random",
+            "margin_mm": 25,
+            "minimum_distance_mm": 300
+          }
+        }
+      ]
+    }
+  ]
+}

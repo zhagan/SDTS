@@ -8,14 +8,21 @@
       "id": "amber",
       "display": { "shape": "circle", "radius_mm": 65, "fill": "#e3b341", "stroke": "#c99a2e" },
       "repeat": true,
+      "durability": {
+        "hits_to_destroy": 1,
+        "min_radius_factor": 0.4
+      },
       "sequence": [
         {
           "action": "show",
           "duration_secs": 8,
           "path": {
-            "type": "line",
-            "from": { "x_mm": 100, "y_mm": 300 },
-            "to": { "x_mm": 1500, "y_mm": 700 }
+            "type": "random_line",
+            "margin_mm": 25,
+            "distance_mm": {
+              "min": 350,
+              "max": 900
+            }
           }
         }
       ]
@@ -24,14 +31,22 @@
       "id": "blue",
       "display": { "shape": "circle", "radius_mm": 65, "fill": "#5aa9e6", "stroke": "#3688c4" },
       "repeat": true,
+      "durability": {
+        "hits_to_destroy": 2,
+        "shrink_per_hit": 0.5,
+        "min_radius_factor": 0.4
+      },
       "sequence": [
         {
           "action": "show",
           "duration_secs": 8,
           "path": {
-            "type": "line",
-            "from": { "x_mm": 1500, "y_mm": 300 },
-            "to": { "x_mm": 100, "y_mm": 700 }
+            "type": "random_line",
+            "margin_mm": 25,
+            "distance_mm": {
+              "min": 350,
+              "max": 900
+            }
           }
         }
       ]

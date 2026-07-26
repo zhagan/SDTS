@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 
 use crate::protocol::{self, Envelope, TYPE_RESULT, TYPE_SESSION_START, TYPE_TARGET_SPAWN, TYPE_TARGET_UPDATE};
-use crate::scenario::Scenario;
+use crate::scenario::{Scenario, TargetDefinition, TargetState};
 use crate::scoring;
 
 /// Errors the engine can report back across the WASM boundary (or to a
@@ -91,6 +91,61 @@ pub struct ScoreEvent {
     pub distance_mm: f64,
     pub x_mm: f64,
     pub y_mm: f64,
+    /// `Some(n)` when the hit target has a `durability` budget (n counts
+    /// down to 0, at which point it's destroyed and respawns via its own
+    /// `sequence`); `None` for an indestructible target or a miss.
+    pub hits_remaining: Option<u32>,
+}
+
+/// Per-target mutable state the engine tracks alongside the (stateless)
+/// `Scenario`: how many hits are left before this target's current
+/// appearance is destroyed, its current (possibly shrunk) radius, and a
+/// clock offset used to fast-forward a destroyed target past the rest of
+/// its current step. `life` is the last-observed `(cycle, step_index)`
+/// while visible, used to detect when a new appearance begins so
+/// `hits_remaining`/`radius_mm` reset to the target's base values.
+#[derive(Debug, Clone)]
+struct TargetRuntime {
+    time_offset: f64,
+    hits_remaining: Option<u32>,
+    radius_mm: f64,
+    life: (u64, usize),
+}
+
+impl TargetRuntime {
+    fn fresh(target: &TargetDefinition) -> Self {
+        TargetRuntime {
+            time_offset: 0.0,
+            hits_remaining: target.durability.as_ref().map(|d| d.hits_to_destroy),
+            radius_mm: target.display.radius_mm,
+            life: (u64::MAX, usize::MAX),
+        }
+    }
+}
+
+/// Evaluates `target`'s state at `global_t` on the engine's live clock,
+/// applying its accumulated `time_offset` (so a target the engine just
+/// destroyed jumps straight to whatever comes next in its own sequence
+/// instead of waiting out the timer). Resets `hits_remaining`/`radius_mm`
+/// to the target's base values whenever a new appearance begins, and
+/// reports the current (possibly shrunk) radius in place of the
+/// scenario's static one.
+fn advance_target(
+    scenario: &Scenario,
+    target: &TargetDefinition,
+    runtime: &mut TargetRuntime,
+    global_t: f64,
+) -> TargetState {
+    let local_t = global_t + runtime.time_offset;
+    let mut state = scenario.target_state_at(target, local_t);
+    let life = (state.cycle, state.step_index);
+    if state.visible && runtime.life != life {
+        runtime.life = life;
+        runtime.hits_remaining = target.durability.as_ref().map(|d| d.hits_to_destroy);
+        runtime.radius_mm = target.display.radius_mm;
+    }
+    state.radius_mm = runtime.radius_mm;
+    state
 }
 
 /// A non-wall-clock, portable id generator. Real session ids for the native
@@ -118,6 +173,9 @@ pub struct Engine {
     finished: bool,
     time: f64,
     targets: HashMap<String, TargetSnapshot>,
+    /// Hit-count/shrink/skip-ahead state per target, keyed by target id.
+    /// See `TargetRuntime`/`advance_target`.
+    target_runtime: HashMap<String, TargetRuntime>,
     hits: u32,
     misses: u32,
     session_start_envelope: Envelope,
@@ -186,6 +244,11 @@ impl Engine {
                 )
             })
             .collect();
+        let target_runtime = scenario
+            .targets
+            .iter()
+            .map(|target| (target.id.clone(), TargetRuntime::fresh(target)))
+            .collect();
 
         Engine {
             scenario,
@@ -196,6 +259,7 @@ impl Engine {
             finished: false,
             time: 0.0,
             targets,
+            target_runtime,
             hits: 0,
             misses: 0,
             session_start_envelope,
@@ -248,11 +312,17 @@ impl Engine {
         self.recording.clear();
         self.recording.push(self.session_start_envelope.clone());
         self.recording.extend(self.target_spawn_envelopes.clone());
+        for target in &self.scenario.targets {
+            if let Some(runtime) = self.target_runtime.get_mut(&target.id) {
+                *runtime = TargetRuntime::fresh(target);
+            }
+        }
         for state in self.scenario.states_at(0.0) {
             if let Some(target) = self.targets.get_mut(&state.id) {
                 target.x_mm = state.x_mm;
                 target.y_mm = state.y_mm;
                 target.visible = state.visible;
+                target.radius_mm = state.radius_mm;
             }
         }
     }
@@ -277,13 +347,26 @@ impl Engine {
         }
         self.time = elapsed_seconds.max(0.0);
         let mut envelopes = Vec::with_capacity(self.scenario.targets.len());
-        for state in self.scenario.states_at(self.time) {
-            if let Some(target) = self.targets.get_mut(&state.id) {
-                target.x_mm = state.x_mm;
-                target.y_mm = state.y_mm;
-                target.visible = state.visible;
+        for target in &self.scenario.targets {
+            let runtime = self
+                .target_runtime
+                .get_mut(&target.id)
+                .expect("runtime tracked for every scenario target");
+            let state = advance_target(&self.scenario, target, runtime, self.time);
+            if let Some(snapshot) = self.targets.get_mut(&state.id) {
+                snapshot.x_mm = state.x_mm;
+                snapshot.y_mm = state.y_mm;
+                snapshot.visible = state.visible;
+                snapshot.radius_mm = state.radius_mm;
             }
-            let env = protocol::target_update(self.time, &state.id, state.x_mm, state.y_mm, state.visible);
+            let env = protocol::target_update(
+                self.time,
+                &state.id,
+                state.x_mm,
+                state.y_mm,
+                state.visible,
+                state.radius_mm,
+            );
             self.recording.push(env.clone());
             envelopes.push(env);
         }
@@ -309,24 +392,41 @@ impl Engine {
                 distance_mm: f64::INFINITY,
                 x_mm,
                 y_mm,
+                hits_remaining: None,
             };
         }
         let impact_env = protocol::impact(t, "mouse", impact_id, x_mm, y_mm);
         self.recording.push(impact_env);
 
-        let states = self.scenario.states_at(t);
-        let best = states
-            .iter()
-            .filter(|target| target.visible)
-            .map(|target| {
-                let outcome = scoring::evaluate((x_mm, y_mm), (target.x_mm, target.y_mm), target.radius_mm);
-                (target, outcome)
-            })
-            .min_by(|(_, a), (_, b)| a.distance_mm.total_cmp(&b.distance_mm));
+        // (target_id, outcome, seconds left in the target's current step —
+        // needed only if this turns out to be the destroying hit).
+        let mut best: Option<(String, scoring::HitResult, f64)> = None;
+        for target in &self.scenario.targets {
+            let runtime = self
+                .target_runtime
+                .get_mut(&target.id)
+                .expect("runtime tracked for every scenario target");
+            let state = advance_target(&self.scenario, target, runtime, t);
+            if !state.visible {
+                continue;
+            }
+            let outcome = scoring::evaluate((x_mm, y_mm), (state.x_mm, state.y_mm), state.radius_mm);
+            let better = best
+                .as_ref()
+                .map(|(_, current, _)| outcome.distance_mm < current.distance_mm)
+                .unwrap_or(true);
+            if better {
+                best = Some((state.id.clone(), outcome, state.remaining_in_step_secs));
+            }
+        }
 
-        let (target_id, hit, distance_mm) = match best {
-            Some((target, outcome)) => (target.id.clone(), outcome.hit, outcome.distance_mm),
-            None => (String::new(), false, f64::INFINITY),
+        let (target_id, hit, distance_mm, hits_remaining) = match best {
+            Some((id, outcome, remaining_in_step_secs)) if outcome.hit => {
+                let hits_remaining = self.apply_hit(&id, remaining_in_step_secs);
+                (id, true, outcome.distance_mm, hits_remaining)
+            }
+            Some((id, outcome, _)) => (id, false, outcome.distance_mm, None),
+            None => (String::new(), false, f64::INFINITY, None),
         };
         if hit {
             self.hits += 1;
@@ -334,7 +434,9 @@ impl Engine {
             self.misses += 1;
         }
 
-        let result_env = protocol::result(t, &target_id, impact_id, hit, distance_mm, x_mm, y_mm);
+        let result_env = protocol::result(
+            t, &target_id, impact_id, hit, distance_mm, x_mm, y_mm, hits_remaining,
+        );
         self.recording.push(result_env);
 
         ScoreEvent {
@@ -345,6 +447,34 @@ impl Engine {
             distance_mm,
             x_mm,
             y_mm,
+            hits_remaining,
+        }
+    }
+
+    /// Applies a landed hit to `target_id`'s durability, if it has any
+    /// (`None` for an indestructible target, left completely untouched).
+    /// On the destroying hit, fast-forwards the target's local clock past
+    /// the rest of its current step (`remaining_in_step_secs`) so it
+    /// immediately advances to whatever comes next in its own `sequence`
+    /// rather than waiting out the timer; otherwise shrinks it toward
+    /// `min_radius_factor` of its base radius. Returns the hits remaining
+    /// after this hit, for the `result` envelope/`ScoreEvent`.
+    fn apply_hit(&mut self, target_id: &str, remaining_in_step_secs: f64) -> Option<u32> {
+        let target = self.scenario.targets.iter().find(|t| t.id == target_id)?;
+        let durability = target.durability.clone()?;
+        let base_radius = target.display.radius_mm;
+        let runtime = self.target_runtime.get_mut(target_id)?;
+        let remaining = runtime.hits_remaining.unwrap_or(durability.hits_to_destroy);
+        if remaining <= 1 {
+            runtime.time_offset += remaining_in_step_secs + 1e-6;
+            runtime.hits_remaining = Some(0);
+            Some(0)
+        } else {
+            let hits_remaining = remaining - 1;
+            runtime.hits_remaining = Some(hits_remaining);
+            runtime.radius_mm = (runtime.radius_mm * durability.shrink_per_hit)
+                .max(base_radius * durability.min_radius_factor);
+            Some(hits_remaining)
         }
     }
 
@@ -502,6 +632,7 @@ impl Engine {
                         target.x_mm = env.data["x_mm"].as_f64().unwrap_or(target.x_mm);
                         target.y_mm = env.data["y_mm"].as_f64().unwrap_or(target.y_mm);
                         target.visible = env.data["visible"].as_bool().unwrap_or(target.visible);
+                        target.radius_mm = env.data["radius_mm"].as_f64().unwrap_or(target.radius_mm);
                     }
                 }
                 k if k == TYPE_RESULT => {
@@ -519,6 +650,7 @@ impl Engine {
                         distance_mm: env.data["distance_mm"].as_f64().unwrap_or(f64::INFINITY),
                         x_mm: env.data["x_mm"].as_f64().unwrap_or(0.0),
                         y_mm: env.data["y_mm"].as_f64().unwrap_or(0.0),
+                        hits_remaining: env.data["hits_remaining"].as_u64().map(|v| v as u32),
                     });
                 }
                 _ => {}
@@ -554,6 +686,67 @@ mod tests {
                             "duration_secs": 1000,
                             "position": { "type": "fixed", "x_mm": 100, "y_mm": 100 }
                         }
+                    ]
+                }
+            ]
+        }"##
+    }
+
+    /// A single stationary target with a 3-hit durability budget: hits 1
+    /// and 2 shrink it (50% per hit, floored at 20% of its 50mm base
+    /// radius), and hit 3 destroys it. The show step's duration (1000s) is
+    /// deliberately huge relative to any `t` used in tests, so the
+    /// destroying hit's clock-skip always lands in the *next* cycle
+    /// (same fixed position, since `position.type == "fixed"` doesn't vary
+    /// by cycle) — a clean, deterministic "respawned" state to assert on
+    /// without needing to advance real time.
+    fn destructible_scenario_json() -> &'static str {
+        r##"{
+            "name": "Destructible Test Target",
+            "seed": 1,
+            "arena": { "width_mm": 800, "height_mm": 600 },
+            "targets": [
+                {
+                    "id": "circle-1",
+                    "display": { "shape": "circle", "radius_mm": 50, "fill": "#fff", "stroke": "#000" },
+                    "repeat": true,
+                    "durability": { "hits_to_destroy": 3, "shrink_per_hit": 0.5, "min_radius_factor": 0.2 },
+                    "sequence": [
+                        {
+                            "action": "show",
+                            "duration_secs": 1000,
+                            "position": { "type": "fixed", "x_mm": 100, "y_mm": 100 }
+                        }
+                    ]
+                }
+            ]
+        }"##
+    }
+
+    /// Two independent stationary targets, both destructible, far enough
+    /// apart that an impact can only ever be closest to one of them.
+    fn two_destructible_targets_scenario_json() -> &'static str {
+        r##"{
+            "name": "Two Destructible Targets",
+            "seed": 1,
+            "arena": { "width_mm": 800, "height_mm": 600 },
+            "targets": [
+                {
+                    "id": "left",
+                    "display": { "shape": "circle", "radius_mm": 50, "fill": "#fff", "stroke": "#000" },
+                    "repeat": true,
+                    "durability": { "hits_to_destroy": 2, "shrink_per_hit": 0.5, "min_radius_factor": 0.2 },
+                    "sequence": [
+                        { "action": "show", "duration_secs": 1000, "position": { "type": "fixed", "x_mm": 100, "y_mm": 100 } }
+                    ]
+                },
+                {
+                    "id": "right",
+                    "display": { "shape": "circle", "radius_mm": 50, "fill": "#fff", "stroke": "#000" },
+                    "repeat": true,
+                    "durability": { "hits_to_destroy": 2, "shrink_per_hit": 0.5, "min_radius_factor": 0.2 },
+                    "sequence": [
+                        { "action": "show", "duration_secs": 1000, "position": { "type": "fixed", "x_mm": 700, "y_mm": 500 } }
                     ]
                 }
             ]
@@ -609,6 +802,74 @@ mod tests {
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.hits, 1);
         assert_eq!(snapshot.misses, 1);
+    }
+
+    #[test]
+    fn hits_shrink_a_destructible_target_and_destroy_it_on_the_final_hit() {
+        let mut engine = Engine::new(destructible_scenario_json()).unwrap();
+        engine.start();
+
+        let first = engine.impact(1.0, "impact-1", 100.0, 100.0);
+        assert!(first.hit);
+        assert_eq!(first.hits_remaining, Some(2));
+        engine.update(1.0);
+        assert_eq!(engine.snapshot().targets[0].radius_mm, 25.0);
+
+        let second = engine.impact(1.0, "impact-2", 100.0, 100.0);
+        assert!(second.hit);
+        assert_eq!(second.hits_remaining, Some(1));
+        engine.update(1.0);
+        assert_eq!(engine.snapshot().targets[0].radius_mm, 12.5);
+
+        // Destroying hit: hits_remaining reaches 0 and the target's clock
+        // skips ahead into its next appearance.
+        let third = engine.impact(1.0, "impact-3", 100.0, 100.0);
+        assert!(third.hit);
+        assert_eq!(third.hits_remaining, Some(0));
+
+        // The next impact lands on a fresh appearance: full size, full
+        // durability restored, same fixed position.
+        let fourth = engine.impact(1.0, "impact-4", 100.0, 100.0);
+        assert!(fourth.hit);
+        assert_eq!(fourth.hits_remaining, Some(2));
+        engine.update(1.0);
+        assert_eq!(engine.snapshot().targets[0].radius_mm, 25.0);
+    }
+
+    #[test]
+    fn indestructible_targets_ignore_hits_remaining_and_never_shrink() {
+        let mut engine = Engine::new(stationary_scenario_json()).unwrap();
+        engine.start();
+        for i in 0..5 {
+            let outcome = engine.impact(1.0, &format!("impact-{i}"), 100.0, 100.0);
+            assert!(outcome.hit);
+            assert_eq!(outcome.hits_remaining, None);
+        }
+        assert_eq!(engine.snapshot().targets[0].radius_mm, 50.0);
+    }
+
+    #[test]
+    fn destroying_one_of_two_simultaneous_targets_leaves_the_other_untouched() {
+        let mut engine = Engine::new(two_destructible_targets_scenario_json()).unwrap();
+        engine.start();
+
+        // Destroy "left" (2 hits) without ever touching "right".
+        let hit1 = engine.impact(1.0, "impact-1", 100.0, 100.0);
+        assert_eq!(hit1.target_id, "left");
+        assert_eq!(hit1.hits_remaining, Some(1));
+        let hit2 = engine.impact(1.0, "impact-2", 100.0, 100.0);
+        assert_eq!(hit2.target_id, "left");
+        assert_eq!(hit2.hits_remaining, Some(0));
+
+        engine.update(1.0);
+        let snapshot = engine.snapshot();
+        let right = snapshot.targets.iter().find(|t| t.id == "right").unwrap();
+        assert_eq!(right.radius_mm, 50.0, "untouched target keeps its base radius");
+
+        // "right" still takes its own full 2 hits to destroy.
+        let hit3 = engine.impact(1.0, "impact-3", 700.0, 500.0);
+        assert_eq!(hit3.target_id, "right");
+        assert_eq!(hit3.hits_remaining, Some(1));
     }
 
     #[test]

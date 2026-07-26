@@ -53,7 +53,8 @@ emits a result:
     "hit": true,
     "distance_mm": 12.7,
     "x_mm": 320.5,
-    "y_mm": 184.0
+    "y_mm": 184.0,
+    "hits_remaining": null
   }
 }
 ```
@@ -61,7 +62,10 @@ emits a result:
 For a `result`, `x_mm` and `y_mm` are the impact coordinates, not the target
 center. Renderers use these coordinates to draw feedback at the location of
 the click. `distance_mm` is the distance between that impact and the target's
-authoritative center at scoring time.
+authoritative center at scoring time. `hits_remaining` is `null` unless the
+target has a `durability` budget (see below), in which case it's the number
+of hits left before the target is destroyed — `0` on the hit that destroyed
+it.
 
 ## Target display and visibility
 
@@ -82,8 +86,8 @@ authoritative center at scoring time.
 }
 ```
 
-`target_update` carries position and visibility. A hidden target must not be
-rendered or considered by scoring.
+`target_update` carries position, visibility, and the target's current
+radius. A hidden target must not be rendered or considered by scoring.
 
 ```json
 {
@@ -94,7 +98,56 @@ rendered or considered by scoring.
     "target_id": "popup",
     "x_mm": 320.5,
     "y_mm": 184,
-    "visible": false
+    "visible": false,
+    "radius_mm": 75
   }
 }
 ```
+
+`radius_mm` here is the target's *live* radius, which only ever differs from
+the constant one in its `target_spawn` for a target with a `durability`
+budget (below) that has taken damage — it shrinks per hit and resets to the
+base radius the instant a fresh appearance begins.
+
+## Destructible targets
+
+A target definition can include an optional `durability` block making it
+destructible:
+
+```json
+{
+  "id": "gallery-1",
+  "display": { "shape": "circle", "radius_mm": 90, "fill": "#c77dff", "stroke": "#9d4edd" },
+  "repeat": true,
+  "durability": {
+    "hits_to_destroy": 3,
+    "shrink_per_hit": 0.75,
+    "min_radius_factor": 0.4
+  },
+  "sequence": [ ... ]
+}
+```
+
+- `hits_to_destroy` — number of hits this appearance can take before it's
+  destroyed.
+- `shrink_per_hit` — radius multiplier applied after each non-destroying
+  hit (default `1.0`, i.e. no shrink — the target just takes
+  `hits_to_destroy` hits at a constant size).
+- `min_radius_factor` — floor for shrinking, as a fraction of the target's
+  base radius (default `0.35`), so repeated hits can't shrink it into an
+  unhittable point.
+
+Omitting `durability` entirely keeps a target indestructible and
+constant-sized (the pre-existing behavior) — this is fully backward
+compatible with scenarios that predate the field.
+
+On the destroying hit, the target is immediately hidden and skips ahead to
+whatever comes next in its own `sequence` — for a `repeat: true` target with
+a single `show` step, that means the very next appearance (often
+repositioned, if using `position: { "type": "random", ... }` or a moving
+`path`), giving the "shoot it, a fresh one appears" behavior. Two targets
+shown simultaneously are always scored and destroyed independently — hitting
+one never affects the other's hit count or size. Every fresh appearance of a
+target (whether reached by being destroyed early or by simply timing out
+normally) resets both `hits_remaining` and its radius to the target's base
+values.
