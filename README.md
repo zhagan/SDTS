@@ -18,7 +18,7 @@ The real OpenSDTS Rust engine — scenario evaluation, scoring, recording, and
 replay — compiled to WebAssembly and running entirely in your browser. No
 server, no backend, no install.
 
-<video src="docs/demo_video/sdts-demo.mp4" controls width="640"></video>
+<video src="https://zackhagan.com/SDTS/demo_video/sdts-demo.mp4" controls width="640"></video>
 
 ---
 
