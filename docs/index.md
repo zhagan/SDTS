@@ -1,5 +1,6 @@
 # OpenSDTS Docs
 
+- [Demo video](demo_video/sdts-demo.mov) — a recorded walkthrough of the browser demo in action.
 - [Architecture](architecture.md) — components and how they fit together (Core, Renderer, Impact Adapter, Scoring, Recorder).
 - [Components](components.md) — responsibilities of each component.
 - [Protocol (SDTP)](protocol.md) — the WebSocket/JSON message envelope shared by every component.
@@ -80,11 +81,8 @@ the same files work unmodified from a local static server or from
 `make build` and deploys `docs/` on every push to `main` that touches
 `crates/`, `scenarios/`, `docs/`, `static/`, or the build scripts —
 publishing is automatic, nothing to build or commit locally. The repo's
-Pages source must be set to "GitHub Actions" (Settings → Pages) for the
-workflow to publish.
-3. In the GitHub repo, open **Settings → Pages**.
-4. Under **Build and deployment**, select **Deploy from a branch**.
-5. Set branch to `main`, folder to `/docs`, and **Save**.
+Pages source must be set to **GitHub Actions** (Settings → Pages →
+Build and deployment) for the workflow to publish.
 
 The demo is then served at `https://zhagan.github.io/SDTS/`.
 
