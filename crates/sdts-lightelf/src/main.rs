@@ -8,7 +8,7 @@ use btleplug::api::WriteType;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 
-use protocol::{ColorMode, ExtendedSettings, LightChannel, Settings};
+use protocol::{ColorMode, DrawCommand, DrawPoint, ExtendedSettings, LightChannel, Settings};
 
 #[derive(Parser)]
 #[command(
@@ -29,12 +29,13 @@ struct Cli {
 enum Command {
     /// List nearby TD5322A_ devices without connecting.
     Scan,
-    /// Connect and dump every GATT service/characteristic/property. Use
-    /// this if `set`/`raw` report success but nothing happens on the
-    /// device — it tells you the real write characteristic and whether it
-    /// actually supports the write type you're using.
+    /// Connect and dump every GATT service/characteristic/property/current
+    /// value (actively reading anything readable, not just passively
+    /// waiting on notifications), plus whatever comes back from sending
+    /// the handshake query. Use this if `set`/`raw` report success but
+    /// nothing happens on the device.
     Inspect,
-    /// Build and send a settings command (power/light/color mode/angle).
+    /// Build and send a settings command (DMX address/light/color mode/angle).
     Set(SetArgs),
     /// Send a raw uppercase hex command string, for protocol exploration.
     Raw {
@@ -47,13 +48,41 @@ enum Command {
         #[arg(long)]
         response: bool,
     },
+    /// Draw a single line: blanked jump to the start point, then a lit
+    /// line to the end point. The minimal case of the app's vector draw
+    /// protocol — see DrawCommand's docs for the unconfirmed 15-byte
+    /// header this sends.
+    DrawLine {
+        #[arg(long, allow_hyphen_values = true)]
+        from_x: i16,
+        #[arg(long, allow_hyphen_values = true)]
+        from_y: i16,
+        #[arg(long, allow_hyphen_values = true)]
+        to_x: i16,
+        #[arg(long, allow_hyphen_values = true)]
+        to_y: i16,
+        /// Palette color index. 0..=15 in the default (legacy) encoding;
+        /// full 0..=255 range under --cmd-new-type.
+        #[arg(long, default_value_t = 0)]
+        color: u8,
+        /// Use the alternate "cmdNewType" frame/point encoding (see
+        /// DrawCommand's docs) instead of the legacy one tried first.
+        #[arg(long)]
+        cmd_new_type: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        response: bool,
+    },
 }
 
 #[derive(clap::Args)]
 struct SetArgs {
-    /// Power/intensity level, app-observed range 1..=512.
+    /// DMX512 address (valArr[0]), 1..=512. Confirmed on hardware: not a
+    /// power/brightness control despite the app's naming — the unit's own
+    /// screen echoes this back as "DMX mode, address <n>".
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=512))]
-    power: u16,
+    dmx_address: u16,
 
     /// Which of the device's three light buttons to select.
     #[arg(long, value_enum)]
@@ -82,10 +111,8 @@ struct SetArgs {
     dual_channels: Vec<u8>,
 
     /// Send the "cmdNewType" extended block with this brightness value
-    /// (0..=255) instead of the legacy 5-byte filler. Separate from
-    /// --power: the app treats `brightness` as its own field, only present
-    /// in this extended block, not part of valArr. Try this if --power
-    /// doesn't visibly change anything.
+    /// (0..=255) instead of the legacy 5-byte filler. Also swept end to
+    /// end with no visible effect so far — see protocol.rs's module docs.
     #[arg(long)]
     brightness: Option<u8>,
 
@@ -139,14 +166,17 @@ async fn main() -> Result<()> {
         Command::Inspect => run_inspect(cli.scan_seconds).await,
         Command::Set(args) => run_set(cli.scan_seconds, args).await,
         Command::Raw { hex, dry_run, response } => run_raw(cli.scan_seconds, hex, dry_run, response).await,
+        Command::DrawLine { from_x, from_y, to_x, to_y, color, cmd_new_type, dry_run, response } => {
+            run_draw_line(cli.scan_seconds, from_x, from_y, to_x, to_y, color, cmd_new_type, dry_run, response).await
+        }
     }
 }
 
 async fn run_inspect(scan_seconds: u64) -> Result<()> {
     println!("Scanning for {}* devices for {scan_seconds}s...", device::DEVICE_NAME_PREFIX);
-    let (name, services) = device::inspect_first(scan_seconds).await?;
-    println!("Connected to {name}. GATT tree:");
-    for service in &services {
+    let report = device::inspect_first(scan_seconds).await?;
+    println!("Connected to {}. GATT tree:", report.name);
+    for service in &report.services {
         println!("  service {}", service.service_uuid);
         for c in &service.chars {
             let mut props = Vec::new();
@@ -165,8 +195,22 @@ async fn run_inspect(scan_seconds: u64) -> Result<()> {
             if c.properties.contains(btleplug::api::CharPropFlags::INDICATE) {
                 props.push("indicate");
             }
-            println!("    char {}  [{}]", c.uuid, props.join(", "));
+            print!("    char {}  [{}]", c.uuid, props.join(", "));
+            match &c.value {
+                Some(v) if v.is_empty() => println!("  value: (empty)"),
+                Some(v) => {
+                    let hex: String = v.iter().map(|b| format!("{b:02X}")).collect();
+                    let ascii: String = v.iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+                    println!("  value: {hex}  ascii: {ascii}");
+                }
+                None => println!(),
+            }
         }
+    }
+    println!("Handshake query response ({} notifications within 1.5s):", report.notifications.len());
+    for (uuid, value) in &report.notifications {
+        let hex: String = value.iter().map(|b| format!("{b:02X}")).collect();
+        println!("  notify {uuid}: {hex}");
     }
     Ok(())
 }
@@ -191,7 +235,7 @@ async fn run_set(scan_seconds: u64, args: SetArgs) -> Result<()> {
         .try_into()
         .expect("clap num_args = 3 guarantees exactly 3 values");
     let settings = Settings {
-        power: args.power,
+        dmx_address: args.dmx_address,
         channel: args.channel,
         xy_angle: args.angle,
         light: args.light.into(),
@@ -288,5 +332,52 @@ async fn run_raw(scan_seconds: u64, hex: String, dry_run: bool, response: bool) 
     dev.send_as(&bytes, write_type).await?;
     report_notifications(&mut notifications, Duration::from_millis(1000)).await;
     dev.disconnect().await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_draw_line(
+    scan_seconds: u64,
+    from_x: i16,
+    from_y: i16,
+    to_x: i16,
+    to_y: i16,
+    color: u8,
+    cmd_new_type: bool,
+    dry_run: bool,
+    response: bool,
+) -> Result<()> {
+    if !cmd_new_type && color > 15 {
+        bail!("--color must be 0..=15 in the legacy encoding (it's packed into a nibble); pass --cmd-new-type for the full 0..=255 range");
+    }
+    let cmd = DrawCommand {
+        points: vec![
+            DrawPoint { x: from_x, y: from_y, color, tag: 1 }, // move (laser off)
+            DrawPoint { x: to_x, y: to_y, color, tag: 0 },     // draw (laser on)
+        ],
+        new_type: cmd_new_type,
+    };
+    let hex = cmd.to_hex_string();
+
+    if dry_run {
+        println!("{hex}");
+        return Ok(());
+    }
+
+    println!("Connecting to {}* (up to {scan_seconds}s)...", device::DEVICE_NAME_PREFIX);
+    let dev = device::connect_first(scan_seconds).await?;
+    let write_type = if response { WriteType::WithResponse } else { WriteType::WithoutResponse };
+    dev.subscribe_all_notifications().await?;
+    let mut notifications = dev.notifications().await?;
+
+    println!("Connected to {}. Sending handshake query (E0E1E2E3E4E5E6E7)...", dev.name);
+    dev.send_as(&device::QUERY_FRAME, write_type).await?;
+    report_notifications(&mut notifications, Duration::from_millis(1500)).await;
+
+    println!("Sending draw-line ({write_type:?}): {hex}");
+    dev.send_as(&cmd.to_bytes(), write_type).await?;
+    report_notifications(&mut notifications, Duration::from_millis(1000)).await;
+    dev.disconnect().await?;
+    println!("Done.");
     Ok(())
 }

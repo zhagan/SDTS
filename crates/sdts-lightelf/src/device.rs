@@ -87,16 +87,11 @@ pub async fn connect_first(scan_secs: u64) -> Result<LightElfDevice> {
     connect(device).await
 }
 
-pub async fn connect(device: DiscoveredDevice) -> Result<LightElfDevice> {
-    let peripheral = device.peripheral;
-    peripheral.connect().await.context("BLE connect failed")?;
-    peripheral
-        .discover_services()
-        .await
-        .context("GATT service discovery failed")?;
-
-    let characteristics = peripheral.characteristics();
-    let write_char = characteristics
+fn find_write_char(
+    characteristics: &std::collections::BTreeSet<btleplug::api::Characteristic>,
+    device_name: &str,
+) -> Result<btleplug::api::Characteristic> {
+    characteristics
         .iter()
         .find(|c| c.service_uuid == SERVICE_PRIMARY && c.uuid == WRITE_PRIMARY)
         .or_else(|| {
@@ -107,11 +102,21 @@ pub async fn connect(device: DiscoveredDevice) -> Result<LightElfDevice> {
         .cloned()
         .with_context(|| {
             format!(
-                "device {} exposes neither the primary ({SERVICE_PRIMARY}/{WRITE_PRIMARY}) \
-                 nor fallback ({SERVICE_FALLBACK}/{WRITE_FALLBACK}) write characteristic",
-                device.name
+                "device {device_name} exposes neither the primary ({SERVICE_PRIMARY}/{WRITE_PRIMARY}) \
+                 nor fallback ({SERVICE_FALLBACK}/{WRITE_FALLBACK}) write characteristic"
             )
-        })?;
+        })
+}
+
+pub async fn connect(device: DiscoveredDevice) -> Result<LightElfDevice> {
+    let peripheral = device.peripheral;
+    peripheral.connect().await.context("BLE connect failed")?;
+    peripheral
+        .discover_services()
+        .await
+        .context("GATT service discovery failed")?;
+
+    let write_char = find_write_char(&peripheral.characteristics(), &device.name)?;
 
     Ok(LightElfDevice {
         name: device.name,
@@ -121,14 +126,19 @@ pub async fn connect(device: DiscoveredDevice) -> Result<LightElfDevice> {
 }
 
 /// Connect to the first matching device and dump its full GATT tree
-/// (every service/characteristic/property), skipping the write-characteristic
-/// lookup `connect` requires. Use this when `set`/`raw` connect fine but
-/// nothing happens on the device — it tells you what's actually there so we
-/// can check our FFE0/FFE2 assumption and each characteristic's real
-/// write properties (write vs. write-without-response matters: a write to a
-/// characteristic that doesn't support the one you used is silently
-/// dropped on most platforms, no error raised).
-pub async fn inspect_first(scan_secs: u64) -> Result<(String, Vec<ServiceReport>)> {
+/// (every service/characteristic/property/current-value), plus anything
+/// that comes back from a handshake query. Use this when `set`/`raw`
+/// connect fine but nothing happens on the device.
+///
+/// Beyond the plain GATT dump, this does two things `set`/`raw` don't:
+/// sends [`QUERY_FRAME`] and passively waits for notifications (same as
+/// they do), *and* actively **reads** every characteristic that advertises
+/// the `read` property. The app does exactly that read right after
+/// subscribing to notifications on connect — worth trying since this
+/// firmware has never sent us a single notification, and a GATT read gets
+/// a characteristic's current value directly without needing the device to
+/// proactively push anything.
+pub async fn inspect_first(scan_secs: u64) -> Result<InspectReport> {
     let devices = scan(scan_secs).await?;
     let device = devices
         .into_iter()
@@ -142,11 +152,41 @@ pub async fn inspect_first(scan_secs: u64) -> Result<(String, Vec<ServiceReport>
         .await
         .context("GATT service discovery failed")?;
 
+    let characteristics = peripheral.characteristics();
+    for c in &characteristics {
+        if c.properties.intersects(CharPropFlags::NOTIFY | CharPropFlags::INDICATE) {
+            let _ = peripheral.subscribe(c).await;
+        }
+    }
+
+    let mut notifications = Vec::new();
+    if let Ok(write_char) = find_write_char(&characteristics, &name) {
+        if let Ok(mut stream) = peripheral.notifications().await {
+            let _ = peripheral.write(&write_char, &QUERY_FRAME, WriteType::WithoutResponse).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    next = futures_util::StreamExt::next(&mut stream) => match next {
+                        Some(n) => notifications.push((n.uuid, n.value)),
+                        None => break,
+                    },
+                }
+            }
+        }
+    }
+
     let mut by_service: std::collections::BTreeMap<Uuid, Vec<CharReport>> = std::collections::BTreeMap::new();
-    for c in peripheral.characteristics() {
+    for c in &characteristics {
+        let value = if c.properties.contains(CharPropFlags::READ) {
+            peripheral.read(c).await.ok()
+        } else {
+            None
+        };
         by_service.entry(c.service_uuid).or_default().push(CharReport {
             uuid: c.uuid,
             properties: c.properties,
+            value,
         });
     }
     let _ = peripheral.disconnect().await;
@@ -158,7 +198,13 @@ pub async fn inspect_first(scan_secs: u64) -> Result<(String, Vec<ServiceReport>
             ServiceReport { service_uuid, chars }
         })
         .collect();
-    Ok((name, services))
+    Ok(InspectReport { name, services, notifications })
+}
+
+pub struct InspectReport {
+    pub name: String,
+    pub services: Vec<ServiceReport>,
+    pub notifications: Vec<(Uuid, Vec<u8>)>,
 }
 
 pub struct ServiceReport {
@@ -169,6 +215,7 @@ pub struct ServiceReport {
 pub struct CharReport {
     pub uuid: Uuid,
     pub properties: CharPropFlags,
+    pub value: Option<Vec<u8>>,
 }
 
 pub struct LightElfDevice {

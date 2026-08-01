@@ -27,14 +27,32 @@
 //! all maxed), `light: Two`/`Three` → pink/magenta (R+B maxed, no G on that
 //! head).
 //!
-//! `power` (valArr[0], 1..=512) and `extended.brightness` (the separate
-//! "cmdNewType" field) were both swept end to end (`1` vs `512`, `1` vs
-//! `255`) with no visible difference either time — neither is confirmed to
-//! do anything. This might be a real no-op, or might just be imperceptible
-//! by eye at these power levels/indoor lighting; wasn't re-tested in a dark
-//! room or through a camera. `channel`, `xy_angle`'s visual effect,
-//! `display_size`'s effect beyond "must be in range", and what (if
-//! anything) distinguishes `Two` from `Three` are all still unconfirmed too.
+//! `dmx_address` (valArr[0], 1..=512) is **not** a power/brightness
+//! control — it's a DMX512 address (see [`Settings::dmx_address`] for how
+//! that was confirmed: the physical unit's own screen echoed back the
+//! value we sent, labeled "DMX mode, address"). That's also why sweeping
+//! it end to end (`1` vs `512`) never visibly changed the output — it was
+//! never a brightness field to begin with. `extended.brightness` (the
+//! separate "cmdNewType" field) was *also* swept end to end (`1` vs `255`,
+//! including a dark-room retest) with no visible change — this one now has
+//! a plausible explanation too: the unit's own screen reports its laser
+//! mode as **TTL**, which drives the diodes as a simple on/off switch with
+//! no continuous/PWM dimming. So the lack of visible brightness control
+//! may just be correct hardware behavior rather than a wrong or missing
+//! field — **however**, retesting the same `1` vs `255` sweep after
+//! switching the unit's laser mode from TTL to **AN** (analog) via its own
+//! menu still showed no difference, which weakens that explanation: analog
+//! drive should be capable of continuous dimming even if TTL isn't. So
+//! `extended.brightness` doing nothing remains genuinely unexplained — it
+//! may just be the wrong field, or the app's actual brightness command
+//! lives somewhere we haven't traced yet. (Screen also showed a software
+//! version, "VC2.3", for whatever that's worth later.) The output is also always some
+//! animated pattern (e.g. rolling circles) rather than a static dot
+//! regardless of these settings — that's the separate "draw" command
+//! channel ([`DrawCommand`]), not something these fields affect.
+//! `channel`, `xy_angle`'s visual effect, `display_size`'s effect beyond
+//! "must be in range", and what (if anything) distinguishes `Two` from
+//! `Three` are all still unconfirmed too.
 
 /// Which of the app's three "light1/2/3" buttons to select — picks between
 /// two distinct diode heads on this hardware (TD5322A_V3.1.2BLE):
@@ -74,8 +92,11 @@ pub struct ExtendedSettings {
 /// One full "settings" command frame, matching the app's `settingData` object.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// Power/intensity level. App-observed range: 1..=512.
-    pub power: u16,
+    /// valArr[0]. Range 1..=512 in the app — almost certainly a **DMX512
+    /// address**, not power/brightness as originally guessed: confirmed on
+    /// hardware (TD5322A_V3.1.2BLE) by sending `300` here and reading the
+    /// unit's own screen back, which reported "DMX mode, address 300".
+    pub dmx_address: u16,
     /// Raw `ch` field — meaning unconfirmed, defaults to 0 in the app for
     /// a single connected device.
     pub channel: u8,
@@ -129,7 +150,7 @@ impl Settings {
         };
 
         let mut s = String::from(FRAME_HEADER);
-        s += &hex_u16(self.power);
+        s += &hex_u16(self.dmx_address);
         s += &hex_u8(self.channel);
         s += &hex_u8(self.display_size);
         s += &hex_u8(self.xy_angle);
@@ -160,6 +181,106 @@ impl Settings {
     }
 }
 
+/// One point in a draw/vector command, matching the app's point tuple
+/// `[x, y, color, tag]` (`getDrawPointStr`/`X` in `utils/funcTools.js`).
+#[derive(Debug, Clone, Copy)]
+pub struct DrawPoint {
+    /// Roughly -400..=400 based on the app editor's bounds check
+    /// (`t<-398||i>398`) — not a hard device-enforced limit we've confirmed.
+    pub x: i16,
+    pub y: i16,
+    /// Palette color index, 0..=15 — packed into the upper nibble alongside
+    /// `tag` in the legacy (non-cmdNewType) point encoding this uses.
+    pub color: u8,
+    /// Movement tag, 0..=15. Confirmed meaning from the app's line editor:
+    /// `0` ("fixed") = laser on, draw a line from the previous point to
+    /// this one. `1` ("move") = laser off, jump to this point without
+    /// drawing. Other tag values (`2` = "moves", and 14/15 from masking
+    /// the editor's "clear"/"delete" 254/255 codes) are unconfirmed.
+    pub tag: u8,
+}
+
+/// A draw command: an ordered list of points, each connected to the
+/// previous one by either a blanked jump (`tag: 1`) or a drawn line
+/// (`tag: 0`). A minimal line is two points: `[move-to start, draw-to end]`.
+///
+/// **Tried on hardware (TD5322A_V3.1.2BLE, unit switched to its own
+/// "draw" mode via the physical menu first): no visible effect from
+/// either `new_type: false` or `new_type: true`.** This is now a
+/// confirmed dead end from static analysis alone — both plausible frame
+/// shapes produced nothing, and this firmware never sends any
+/// notification/ack we could use to tell "rejected" from "wrong shape
+/// entirely" apart. Further progress here most likely needs a real packet
+/// capture of the official app drawing a line (e.g. Android's Bluetooth
+/// HCI snoop log), not more guessing from the JS source.
+///
+/// **The 15-byte header this encodes is an unconfirmed all-zero guess** —
+/// though it does match the app's own default `pisObj.cnfValus` seen in
+/// several places in the bundle (`[0,0,0,0,0,0,0,0,0,0,0,0,0,0]`), so it's
+/// at least a plausible one, not an arbitrary one. The app builds it from
+/// `cnfValus`, a per-pattern config array whose contents we've never
+/// captured off a live device (no notification response has come back
+/// from this firmware for anything we've sent so far) — most likely
+/// culprit if the frame shape itself turns out to be right.
+#[derive(Debug, Clone)]
+pub struct DrawCommand {
+    pub points: Vec<DrawPoint>,
+    /// Selects which of the app's two frame/point encodings to build —
+    /// this is a real fork in `H()`/`X()` based on a `cmdNewType` device
+    /// capability flag we have no confirmed read on for this hardware.
+    /// `false` (legacy): frame is `F0F1F2F3...F4F5F6F7`, points are 5
+    /// bytes (`x,y,color<<4|tag`, color 0..=15). `true`: frame is
+    /// `F01F0000...F4F5F6F7`, points are 6 bytes (`x,y,color,tag`, color
+    /// gets its own full byte). Both tried on hardware with no visible
+    /// result — see the struct docs above.
+    pub new_type: bool,
+}
+
+/// The app's `m(e,4)` sign-magnitude encoding (not two's complement):
+/// negative values set bit 15 and store the magnitude in the low 15 bits.
+fn encode_signed16(v: i16) -> u16 {
+    if v < 0 {
+        0x8000 | ((-(v as i32)) as u16 & 0x7FFF)
+    } else {
+        v as u16
+    }
+}
+
+impl DrawCommand {
+    /// Encode into the uppercase hex command string, mirroring
+    /// `getDrawCmdStr` -> `H(X(...), features, 0)` with no `picsPlay`/
+    /// `textStopTime` features set (both unconfirmed for this device, so
+    /// taking the plainest path through those two branches regardless of
+    /// `new_type`).
+    pub fn to_hex_string(&self) -> String {
+        let mut body = String::new();
+        body.push_str(&"00".repeat(15)); // cnfValus[0..14] header — see struct docs
+        body.push_str("00"); // marker byte the app always appends before the point list
+        body.push_str(&format!("{:04X}", self.points.len()));
+
+        for p in &self.points {
+            body.push_str(&format!("{:04X}", encode_signed16(p.x)));
+            body.push_str(&format!("{:04X}", encode_signed16(p.y)));
+            if self.new_type {
+                body.push_str(&format!("{:02X}", p.color));
+                body.push_str(&format!("{:02X}", p.tag & 0x0F));
+            } else {
+                body.push_str(&format!("{:02X}", (p.color << 4) | (p.tag & 0x0F)));
+            }
+        }
+
+        if self.new_type {
+            format!("F01F0000{body}F4F5F6F7")
+        } else {
+            format!("F0F1F2F3{body}F4F5F6F7")
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        hex_string_to_bytes(&self.to_hex_string())
+    }
+}
+
 fn hex_string_to_bytes(hex: &str) -> Vec<u8> {
     debug_assert!(hex.len() % 2 == 0);
     (0..hex.len())
@@ -174,7 +295,7 @@ mod tests {
 
     fn base() -> Settings {
         Settings {
-            power: 300,
+            dmx_address: 300,
             channel: 0,
             xy_angle: 0,
             light: LightChannel::One,
@@ -210,9 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn power_encodes_as_big_endian_u16_right_after_the_header() {
+    fn dmx_address_encodes_as_big_endian_u16_right_after_the_header() {
         let mut s = base();
-        s.power = 0x1234;
+        s.dmx_address = 0x1234;
         let hex = s.to_hex_string();
         assert_eq!(&hex[8..12], "1234");
     }
@@ -236,5 +357,72 @@ mod tests {
         assert_eq!(s.to_bytes().len(), s.to_hex_string().len() / 2);
         assert_eq!(s.to_bytes()[0], 0x00);
         assert_eq!(s.to_bytes()[1], 0x01);
+    }
+
+    #[test]
+    fn draw_frame_uses_the_f0f1_sentinels_with_no_checksum() {
+        let cmd = DrawCommand { points: vec![], new_type: false };
+        let hex = cmd.to_hex_string();
+        assert!(hex.starts_with("F0F1F2F3"));
+        assert!(hex.ends_with("F4F5F6F7"));
+    }
+
+    #[test]
+    fn draw_header_is_15_zero_bytes_plus_marker_before_the_point_count() {
+        let cmd = DrawCommand { points: vec![], new_type: false };
+        let hex = cmd.to_hex_string();
+        // "F0F1F2F3" (8 chars) + 15 zero bytes (30 chars) + marker (2 chars) = 40.
+        assert_eq!(&hex[8..40], &"00".repeat(16));
+        assert_eq!(&hex[40..44], "0000"); // zero points
+    }
+
+    #[test]
+    fn draw_point_packs_color_into_upper_nibble_and_tag_into_lower_nibble() {
+        let cmd = DrawCommand {
+            points: vec![DrawPoint { x: 0, y: 0, color: 2, tag: 1 }],
+            new_type: false,
+        };
+        let hex = cmd.to_hex_string();
+        assert_eq!(&hex[40..44], "0001"); // point count
+        assert_eq!(&hex[44..54], "0000000021"); // x=0000 y=0000 (2<<4)|1=0x21
+    }
+
+    #[test]
+    fn draw_point_encodes_negative_coordinates_as_sign_magnitude_not_twos_complement() {
+        let cmd = DrawCommand {
+            points: vec![DrawPoint { x: -5, y: -300, color: 0, tag: 0 }],
+            new_type: false,
+        };
+        let hex = cmd.to_hex_string();
+        // -5 -> 0x8000|5 = 0x8005; -300 -> 0x8000|0x012C = 0x812C.
+        assert_eq!(&hex[44..54], "8005812C00");
+    }
+
+    #[test]
+    fn draw_line_is_a_move_point_followed_by_a_draw_point() {
+        let cmd = DrawCommand {
+            points: vec![
+                DrawPoint { x: 0, y: 0, color: 0, tag: 1 },
+                DrawPoint { x: 100, y: 50, color: 2, tag: 0 },
+            ],
+            new_type: false,
+        };
+        let hex = cmd.to_hex_string();
+        assert_eq!(&hex[40..44], "0002");
+        assert_eq!(&hex[44..54], "0000000001"); // move to (0,0)
+        assert_eq!(&hex[54..64], "0064003220"); // draw to (100,50), color 2
+    }
+
+    #[test]
+    fn new_type_frame_uses_the_f01f_sentinel_and_6_byte_points() {
+        let cmd = DrawCommand {
+            points: vec![DrawPoint { x: 0, y: 0, color: 200, tag: 1 }],
+            new_type: true,
+        };
+        let hex = cmd.to_hex_string();
+        assert!(hex.starts_with("F01F0000"));
+        assert!(hex.ends_with("F4F5F6F7"));
+        // "F01F0000" (8) + 15 zero bytes (30) + marker (2) + count (4) = 44.
+        assert_eq!(&hex[44..44 + 12], "00000000C801"); // x=0000 y=0000 color=C8(200) tag=01
     }
 }
