@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sdts-engine", "crates/sdts-server", "crates/sdts-wasm"]
+members = ["crates/sdts-engine", "crates/sdts-server", "crates/sdts-wasm", "crates/sdts-lightelf"]
 
 [profile.release]
 opt-level = "s"
