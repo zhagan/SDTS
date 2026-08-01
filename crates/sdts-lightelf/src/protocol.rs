@@ -322,54 +322,41 @@ impl PowerCommand {
 /// (0..=12, clamped by the app's own status-parsing code) is the field
 /// that selects the device's mode.
 ///
-/// **Confirmed mapping** (from the app's own tag-to-page navigation code
-/// in `pages/main/main.js`, cross-checked against real hardware — the
-/// device's own status readback reported `cur_mode: 8` while its screen
-/// showed "draw", matching the app's `8 == tag` → draw-page route exactly):
-/// - `0` = DMX/main settings (routed differently — through `settingClick`
-///   and the settings page, not this frame's normal per-tag path)
+/// **Full mapping confirmed on hardware** (swept every value 0..=12 with
+/// this exact command and read the device's own screen after each):
+/// - `0` = dmx
+/// - `1` = random
+/// - `2` = line
+/// - `3` = anime
 /// - `4` = text
-/// - `7` = "pgs" (program groups)
-/// - `8` = draw — **confirmed on hardware**
-/// - `9` = "listMaster" (likely "anime")
-/// - `1, 2, 3, 5, 6, 11, 12` = generic preset-pattern pages
-///   (`/subPrj1/pages/prj?tag=`) — presumably line/random/ilda/break-mark
-///   among these, but which number is which is not confirmed
+/// - `5` = ilda
+/// - `6` = mark ("break mark" on the on-device menu)
+/// - `7` = program
+/// - `8` = draw
+/// - `9..=12` = unused (no visible effect)
 ///
-/// The real command carries a lot more than this encodes: text-scroll
-/// settings (color/size/speed/distance), per-item project selection, and
-/// group colors. This sends the app's own "nothing configured" defaults
-/// for all of that (empty project items, empty group list) — traced
-/// directly from what `u()` does when its optional `groupList` argument is
-/// omitted. Whether that's enough to actually *switch* to non-draw modes
-/// (vs. just being what the status readback echoes back) isn't confirmed
-/// — only the `cur_mode` field/value mapping is verified so far.
+/// Getting here took two fixes: first, the frame originally encoded the
+/// app's "nothing configured" JS-level defaults for everything but
+/// `cur_mode`, which was wrong in a way that mattered — real captures of
+/// the app switching modes never send an empty project-item list, they
+/// send 4 items' worth of real default data, and the empty version was a
+/// structurally-valid but 36-bytes-short frame (68 instead of the real
+/// 104) that never visibly did anything. Second, even v1 of that fix (this
+/// doc used to say "not yet re-tried") needed the actual hardware sweep
+/// above to confirm it — the byte template alone wasn't proof of a working
+/// mode switch, only the sweep was.
 #[derive(Debug, Clone, Copy)]
 pub struct ModeCommand {
     pub cur_mode: u8,
 }
 
+/// Everything after `cur_mode` in a real captured mode-switch frame,
+/// verbatim — see `ModeCommand`'s docs.
+const MODE_FRAME_TEMPLATE: &str = "00099999FF00FF0066FFFFFFFF640000FFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFF0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
 impl ModeCommand {
     pub fn to_hex_string(&self) -> String {
-        let mut s = String::from("C0C1C2C3");
-        s += &hex_u8(self.cur_mode); // curMode
-        s += "00"; // always-zero field
-        s += "00"; // textData.txColor (default 0)
-        s += "00"; // textData.txSize-derived (default 0)
-        s += "00"; // duplicate of the above in the app's own code
-        s += "00"; // textData.runSpeed-derived (default 0)
-        s += "00"; // fixed reserved byte
-        s += "00"; // textData.txDist-derived (default 0)
-        s += "00"; // prjData.public.rdMode (default 0)
-        s += "00"; // prjData.public.soundVal-derived (default 0)
-        s += "FFFFFFFF0000"; // group-color reserved block, app's own default
-        // prjData.prjItem selections — empty (no items configured)
-        s += "00"; // textData.runDir (0 unless arbPlay/cmdNewType features)
-        s += &"00".repeat(6);
-        // "newPrjs" item selections — empty
-        s += &"00".repeat(37); // padding to the frame's fixed tail length
-        s += "C4C5C6C7";
-        s
+        format!("C0C1C2C3{}{MODE_FRAME_TEMPLATE}C4C5C6C7", hex_u8(self.cur_mode))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -553,13 +540,20 @@ mod tests {
         let hex = ModeCommand { cur_mode: 0 }.to_hex_string();
         assert!(hex.starts_with("C0C1C2C3"));
         assert!(hex.ends_with("C4C5C6C7"));
-        // 4 (header) + 60 (payload, see struct docs) + 4 (trailer) = 68 bytes.
-        assert_eq!(hex.len(), 136);
+        // 4 (header) + 96 (payload, see struct docs) + 4 (trailer) = 104 bytes.
+        assert_eq!(hex.len(), 208);
     }
 
     #[test]
     fn mode_frame_puts_cur_mode_right_after_the_header() {
         let hex = ModeCommand { cur_mode: 5 }.to_hex_string();
         assert_eq!(&hex[8..10], "05");
+    }
+
+    #[test]
+    fn mode_frame_matches_a_real_captured_frame_byte_for_byte() {
+        // Captured from the official app switching to mode 8 ("draw").
+        let captured = "C0C1C2C30800099999FF00FF0066FFFFFFFF640000FFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFF0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000C4C5C6C7";
+        assert_eq!(ModeCommand { cur_mode: 8 }.to_hex_string(), captured);
     }
 }

@@ -76,6 +76,30 @@ enum Command {
         #[arg(long)]
         response: bool,
     },
+    /// Draw a circle: a shape-start marker followed by evenly-spaced
+    /// outline points, tagged the way a real captured circle from the
+    /// official app was (see DrawCommand's docs).
+    DrawCircle {
+        #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+        center_x: i16,
+        #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+        center_y: i16,
+        /// Real captured circles from the app were roughly 100..=113.
+        #[arg(long, default_value_t = 100)]
+        radius: u16,
+        /// Outline point count. Real captured circles all used 44.
+        #[arg(long, default_value_t = 44, value_parser = clap::value_parser!(u16).range(3..=800))]
+        points: u16,
+        /// Palette color index. Confirmed on hardware: 1=red, 2=green, 3=blue.
+        #[arg(long, default_value_t = 1)]
+        color: u8,
+        #[arg(long)]
+        cmd_new_type: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        response: bool,
+    },
     /// Turn the device on or off — a distinct command from `set`, traced
     /// from the app's `onOffChange`. Not yet tried on hardware.
     Power {
@@ -90,10 +114,9 @@ enum Command {
         #[arg(long)]
         response: bool,
     },
-    /// Set the device's operating mode (dmx/draw/line/etc. on its on-screen
-    /// "mode set"). The mapping from this number to a specific mode name
-    /// is NOT known yet — see ModeCommand's docs. Try values 0..=12 and
-    /// watch the device's screen to build that mapping.
+    /// Set the device's operating mode. Confirmed on hardware: 0=dmx,
+    /// 1=random, 2=line, 3=anime, 4=text, 5=ilda, 6=mark, 7=program,
+    /// 8=draw, 9..=12=unused. See ModeCommand's docs for details.
     Mode {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=12))]
         cur_mode: u8,
@@ -202,6 +225,9 @@ async fn main() -> Result<()> {
         Command::Raw { hex, dry_run, response } => run_raw(cli.scan_seconds, hex, dry_run, response).await,
         Command::DrawLine { from_x, from_y, to_x, to_y, color, cmd_new_type, dry_run, response } => {
             run_draw_line(cli.scan_seconds, from_x, from_y, to_x, to_y, color, cmd_new_type, dry_run, response).await
+        }
+        Command::DrawCircle { center_x, center_y, radius, points, color, cmd_new_type, dry_run, response } => {
+            run_draw_circle(cli.scan_seconds, center_x, center_y, radius, points, color, cmd_new_type, dry_run, response).await
         }
         Command::Power { state, cmd_new_type, dry_run, response } => {
             run_power(cli.scan_seconds, matches!(state, PowerArg::On), cmd_new_type, dry_run, response).await
@@ -424,6 +450,71 @@ async fn run_draw_line(
     print_notifications(&query_responses);
 
     println!("Sending draw-line ({write_type:?}): {hex}");
+    dev.send_as(&cmd.to_bytes(), write_type).await?;
+    report_notifications(&mut notifications, Duration::from_millis(1000)).await;
+    dev.disconnect().await?;
+    println!("Done.");
+    Ok(())
+}
+
+/// Build a circle's point list: a shape-start marker at the first outline
+/// point, then evenly-spaced outline points around the circumference,
+/// with the last point tagged 3 instead of 0 — matching a real captured
+/// circle from the official app (see DrawCommand's docs).
+fn circle_points(center_x: i16, center_y: i16, radius: u16, count: u16, color: u8) -> Vec<DrawPoint> {
+    let point_at = |i: u16| {
+        let angle = std::f64::consts::TAU * f64::from(i) / f64::from(count);
+        let x = f64::from(center_x) + f64::from(radius) * angle.cos();
+        let y = f64::from(center_y) + f64::from(radius) * angle.sin();
+        (x.round() as i16, y.round() as i16)
+    };
+    let (first_x, first_y) = point_at(0);
+    let mut points = vec![DrawPoint { x: first_x, y: first_y, color: 0, tag: 2 }];
+    for i in 0..count {
+        let (x, y) = point_at(i);
+        let tag = if i == count - 1 { 3 } else { 0 };
+        points.push(DrawPoint { x, y, color, tag });
+    }
+    points
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_draw_circle(
+    scan_seconds: u64,
+    center_x: i16,
+    center_y: i16,
+    radius: u16,
+    points: u16,
+    color: u8,
+    cmd_new_type: bool,
+    dry_run: bool,
+    response: bool,
+) -> Result<()> {
+    if !cmd_new_type && color > 15 {
+        bail!("--color must be 0..=15 in the legacy encoding (it's packed into a nibble); pass --cmd-new-type for the full 0..=255 range");
+    }
+    let cmd = DrawCommand {
+        points: circle_points(center_x, center_y, radius, points, color),
+        new_type: cmd_new_type,
+    };
+    let hex = cmd.to_hex_string();
+
+    if dry_run {
+        println!("{hex}");
+        return Ok(());
+    }
+
+    println!("Connecting to {}* (up to {scan_seconds}s)...", device::DEVICE_NAME_PREFIX);
+    let dev = device::connect_first(scan_seconds).await?;
+    let write_type = if response { WriteType::WithResponse } else { WriteType::WithoutResponse };
+    dev.subscribe_all_notifications().await?;
+    let mut notifications = dev.notifications().await?;
+
+    println!("Connected to {}. Sending handshake query (retrying up to 3x, 3s apart)...", dev.name);
+    let query_responses = dev.query_with_retries(&mut notifications, write_type).await?;
+    print_notifications(&query_responses);
+
+    println!("Sending draw-circle ({write_type:?}, {points} points): {hex}");
     dev.send_as(&cmd.to_bytes(), write_type).await?;
     report_notifications(&mut notifications, Duration::from_millis(1000)).await;
     dev.disconnect().await?;
