@@ -27,13 +27,23 @@ const WRITE_FALLBACK: Uuid = uuid!("0000ff02-0000-1000-8000-00805f9b34fb");
 const CHUNK_LEN: usize = 20;
 const CHUNK_DELAY: Duration = Duration::from_millis(20);
 
-/// The app's `getQueryCmd(this.randomCheck)` with `randomCheck`'s default
-/// value (`[]`) — an empty payload between the `E0E1E2E3`/`E4E5E6E7`
-/// sentinels. The app sends exactly this, unconditionally, right after
-/// connecting and before any settings command, retrying every 3s up to 3
-/// times while showing a "reading device parameters" spinner. Send this
-/// first; the device's status response is framed `C0C1C2C3...D4D5D6D7`.
-pub const QUERY_FRAME: [u8; 8] = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7];
+/// The app's `getQueryCmd(this.randomCheck)` with a real 4-byte random
+/// challenge (`genRandomCheck()` in `pages/main/main.js`), confirmed from
+/// an actual packet capture of the official app: `E0E1E2E3` + 4 random
+/// bytes + `E4E5E6E7`. We'd previously sent this with an *empty* payload
+/// (`randomCheck`'s uninitialized default, `[]`, before `genRandomCheck()`
+/// ever populates it) — almost certainly why this firmware never
+/// responded to us; the real capture shows the device answering this
+/// exact shape with a ~483-byte status burst. The device's response
+/// embeds a checksum derived from these bytes (see `checkRcvData` in the
+/// app), which we don't validate — any 4 random bytes should still get a
+/// real response back.
+pub fn query_frame() -> [u8; 12] {
+    use rand::Rng;
+    let mut frame = [0xE0, 0xE1, 0xE2, 0xE3, 0, 0, 0, 0, 0xE4, 0xE5, 0xE6, 0xE7];
+    rand::thread_rng().fill(&mut frame[4..8]);
+    frame
+}
 
 pub struct DiscoveredDevice {
     pub name: String,
@@ -131,7 +141,7 @@ pub async fn connect(device: DiscoveredDevice) -> Result<LightElfDevice> {
 /// connect fine but nothing happens on the device.
 ///
 /// Beyond the plain GATT dump, this does two things `set`/`raw` don't:
-/// sends [`QUERY_FRAME`] and passively waits for notifications (same as
+/// sends [`query_frame`] and passively waits for notifications (same as
 /// they do), *and* actively **reads** every characteristic that advertises
 /// the `read` property. The app does exactly that read right after
 /// subscribing to notifications on connect — worth trying since this
@@ -162,15 +172,24 @@ pub async fn inspect_first(scan_secs: u64) -> Result<InspectReport> {
     let mut notifications = Vec::new();
     if let Ok(write_char) = find_write_char(&characteristics, &name) {
         if let Ok(mut stream) = peripheral.notifications().await {
-            let _ = peripheral.write(&write_char, &QUERY_FRAME, WriteType::WithoutResponse).await;
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    next = futures_util::StreamExt::next(&mut stream) => match next {
-                        Some(n) => notifications.push((n.uuid, n.value)),
-                        None => break,
-                    },
+            // Real capture evidence: the device only answered the *second*
+            // query attempt, sent 3s after the first (matching the app's
+            // own goQueryCmd retry timer) — a single short wait isn't
+            // enough, so retry up to 3 times like the app does.
+            for _attempt in 0..3 {
+                let _ = peripheral.write(&write_char, &query_frame(), WriteType::WithoutResponse).await;
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => break,
+                        next = futures_util::StreamExt::next(&mut stream) => match next {
+                            Some(n) => notifications.push((n.uuid, n.value)),
+                            None => break,
+                        },
+                    }
+                }
+                if !notifications.is_empty() {
+                    break;
                 }
             }
         }
@@ -267,5 +286,37 @@ impl LightElfDevice {
     /// through one stream, tagged with `.uuid`).
     pub async fn notifications(&self) -> Result<impl Stream<Item = ValueNotification> + '_> {
         self.peripheral.notifications().await.context("opening notification stream")
+    }
+
+    /// Send [`query_frame`], retrying up to 3 times with a 3s wait each
+    /// time, matching the app's own `goQueryCmd` retry timer — real
+    /// capture evidence shows the device only answering the *second*
+    /// attempt, sent 3s after the first, so a single short wait misses it.
+    /// Stops early once any notification arrives. Call
+    /// [`Self::subscribe_all_notifications`] and get a stream from
+    /// [`Self::notifications`] first, or this will see nothing.
+    pub async fn query_with_retries(
+        &self,
+        stream: &mut (impl Stream<Item = ValueNotification> + Unpin),
+        write_type: WriteType,
+    ) -> Result<Vec<ValueNotification>> {
+        let mut received = Vec::new();
+        for _attempt in 0..3 {
+            self.send_as(&query_frame(), write_type).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    next = futures_util::StreamExt::next(stream) => match next {
+                        Some(n) => received.push(n),
+                        None => break,
+                    },
+                }
+            }
+            if !received.is_empty() {
+                break;
+            }
+        }
+        Ok(received)
     }
 }

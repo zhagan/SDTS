@@ -183,45 +183,52 @@ impl Settings {
 
 /// One point in a draw/vector command, matching the app's point tuple
 /// `[x, y, color, tag]` (`getDrawPointStr`/`X` in `utils/funcTools.js`).
+///
+/// **Confirmed from a real packet capture of the official app** drawing 3
+/// circles (see [`DrawCommand`]'s docs): each shape is `[start marker,
+/// ...outline points]`, where the start marker is a point at the shape's
+/// first coordinate with `color: 0` (a dummy/placeholder — not part of the
+/// palette) and `tag: 2`, followed by the outline's real points at
+/// `tag: 0`, with the shape's *last* point at `tag: 3` instead of `0`.
 #[derive(Debug, Clone, Copy)]
 pub struct DrawPoint {
     /// Roughly -400..=400 based on the app editor's bounds check
     /// (`t<-398||i>398`) — not a hard device-enforced limit we've confirmed.
     pub x: i16,
     pub y: i16,
-    /// Palette color index, 0..=15 — packed into the upper nibble alongside
-    /// `tag` in the legacy (non-cmdNewType) point encoding this uses.
+    /// Palette color index. **Confirmed on hardware**: `1` = red, `2` =
+    /// green, `3` = blue. `0` is not a real color — it's the placeholder
+    /// value the app sends on shape-start marker points (see `tag`).
+    /// Packed into the upper nibble alongside `tag` in the legacy
+    /// (non-cmdNewType) point encoding this uses.
     pub color: u8,
-    /// Movement tag, 0..=15. Confirmed meaning from the app's line editor:
-    /// `0` ("fixed") = laser on, draw a line from the previous point to
-    /// this one. `1` ("move") = laser off, jump to this point without
-    /// drawing. Other tag values (`2` = "moves", and 14/15 from masking
-    /// the editor's "clear"/"delete" 254/255 codes) are unconfirmed.
+    /// Movement tag. **Confirmed on hardware**: `0` = normal outline point
+    /// (laser on, draw from the previous point to this one), `2` = shape-
+    /// start marker (laser off, begin a new shape here — pair with
+    /// `color: 0`), `3` = the *last* point of a shape (like `0`, but marks
+    /// the end). A `1` ("move", from the app's line-editor code) is
+    /// unconfirmed on hardware — real draws use `2` for jumps, not `1`.
     pub tag: u8,
 }
 
-/// A draw command: an ordered list of points, each connected to the
-/// previous one by either a blanked jump (`tag: 1`) or a drawn line
-/// (`tag: 0`). A minimal line is two points: `[move-to start, draw-to end]`.
+/// A draw command: an ordered list of points forming one or more shapes.
+/// Each shape is `[start-marker, ...outline points]` — see [`DrawPoint`]'s
+/// docs for the confirmed tag/color meanings.
 ///
-/// **Tried on hardware (TD5322A_V3.1.2BLE, unit switched to its own
-/// "draw" mode via the physical menu first): no visible effect from
-/// either `new_type: false` or `new_type: true`.** This is now a
-/// confirmed dead end from static analysis alone — both plausible frame
-/// shapes produced nothing, and this firmware never sends any
-/// notification/ack we could use to tell "rejected" from "wrong shape
-/// entirely" apart. Further progress here most likely needs a real packet
-/// capture of the official app drawing a line (e.g. Android's Bluetooth
-/// HCI snoop log), not more guessing from the JS source.
+/// **Verified byte-for-byte against a real packet capture of the official
+/// app** drawing 3 circles on this exact hardware (TD5322A_V3.1.2BLE):
+/// captured frame was 135 points × 5 bytes, decoding with zero leftover
+/// bytes against this exact structure (15-byte header, 1-byte marker,
+/// 2-byte count, legacy 5-byte points) — header was all-zero in the real
+/// capture too, confirming that guess. Our own earlier `draw-line` attempts
+/// failed only because we had the wrong tag values (`1`/`0` instead of the
+/// real `2`/`0`/`3` scheme) — the frame shape itself was always right.
+/// **`draw-line` with the corrected tags is now confirmed working on
+/// hardware** — drew a real horizontal line.
 ///
-/// **The 15-byte header this encodes is an unconfirmed all-zero guess** —
-/// though it does match the app's own default `pisObj.cnfValus` seen in
-/// several places in the bundle (`[0,0,0,0,0,0,0,0,0,0,0,0,0,0]`), so it's
-/// at least a plausible one, not an arbitrary one. The app builds it from
-/// `cnfValus`, a per-pattern config array whose contents we've never
-/// captured off a live device (no notification response has come back
-/// from this firmware for anything we've sent so far) — most likely
-/// culprit if the frame shape itself turns out to be right.
+/// Still unconfirmed: `new_type: true` (the capture only exercised the
+/// legacy encoding), and the header's role when it's *not* all-zero (e.g.
+/// text-scroll/project settings this doesn't yet expose).
 #[derive(Debug, Clone)]
 pub struct DrawCommand {
     pub points: Vec<DrawPoint>,
@@ -274,6 +281,95 @@ impl DrawCommand {
         } else {
             format!("F0F1F2F3{body}F4F5F6F7")
         }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        hex_string_to_bytes(&self.to_hex_string())
+    }
+}
+
+/// The app's power on/off toggle (`onOffChange` in `pages/main/main.js`) —
+/// a distinct `B0B1B2B3...B4B5B6B7` frame family, unrelated to both the
+/// settings frame and the draw frame. **Confirmed working on hardware**
+/// (TD5322A_V3.1.2BLE, legacy/`new_type: false` encoding) — unlike the
+/// draw command, this one actually does something.
+#[derive(Debug, Clone, Copy)]
+pub struct PowerCommand {
+    pub on: bool,
+    /// Same `cmdNewType` fork as [`Settings`]/[`DrawCommand`] — the app
+    /// sends a wider zero-padded payload under that capability flag.
+    pub new_type: bool,
+}
+
+impl PowerCommand {
+    pub fn to_hex_string(&self) -> String {
+        let on_byte = if self.on { "FF" } else { "00" };
+        if self.new_type {
+            format!("B0B1B2B3{on_byte}{}B4B5B6B7", "00".repeat(7))
+        } else {
+            format!("B0B1B2B3{on_byte}B4B5B6B7")
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        hex_string_to_bytes(&self.to_hex_string())
+    }
+}
+
+/// The app's combined mode/text/project command (`u`, exported as
+/// `getCmdStr`, in `utils/funcTools.js`) — a `C0C1C2C3...C4C5C6C7` frame,
+/// different from both the settings frame and the draw frame. `cur_mode`
+/// (0..=12, clamped by the app's own status-parsing code) is the field
+/// that selects the device's mode.
+///
+/// **Confirmed mapping** (from the app's own tag-to-page navigation code
+/// in `pages/main/main.js`, cross-checked against real hardware — the
+/// device's own status readback reported `cur_mode: 8` while its screen
+/// showed "draw", matching the app's `8 == tag` → draw-page route exactly):
+/// - `0` = DMX/main settings (routed differently — through `settingClick`
+///   and the settings page, not this frame's normal per-tag path)
+/// - `4` = text
+/// - `7` = "pgs" (program groups)
+/// - `8` = draw — **confirmed on hardware**
+/// - `9` = "listMaster" (likely "anime")
+/// - `1, 2, 3, 5, 6, 11, 12` = generic preset-pattern pages
+///   (`/subPrj1/pages/prj?tag=`) — presumably line/random/ilda/break-mark
+///   among these, but which number is which is not confirmed
+///
+/// The real command carries a lot more than this encodes: text-scroll
+/// settings (color/size/speed/distance), per-item project selection, and
+/// group colors. This sends the app's own "nothing configured" defaults
+/// for all of that (empty project items, empty group list) — traced
+/// directly from what `u()` does when its optional `groupList` argument is
+/// omitted. Whether that's enough to actually *switch* to non-draw modes
+/// (vs. just being what the status readback echoes back) isn't confirmed
+/// — only the `cur_mode` field/value mapping is verified so far.
+#[derive(Debug, Clone, Copy)]
+pub struct ModeCommand {
+    pub cur_mode: u8,
+}
+
+impl ModeCommand {
+    pub fn to_hex_string(&self) -> String {
+        let mut s = String::from("C0C1C2C3");
+        s += &hex_u8(self.cur_mode); // curMode
+        s += "00"; // always-zero field
+        s += "00"; // textData.txColor (default 0)
+        s += "00"; // textData.txSize-derived (default 0)
+        s += "00"; // duplicate of the above in the app's own code
+        s += "00"; // textData.runSpeed-derived (default 0)
+        s += "00"; // fixed reserved byte
+        s += "00"; // textData.txDist-derived (default 0)
+        s += "00"; // prjData.public.rdMode (default 0)
+        s += "00"; // prjData.public.soundVal-derived (default 0)
+        s += "FFFFFFFF0000"; // group-color reserved block, app's own default
+        // prjData.prjItem selections — empty (no items configured)
+        s += "00"; // textData.runDir (0 unless arbPlay/cmdNewType features)
+        s += &"00".repeat(6);
+        // "newPrjs" item selections — empty
+        s += &"00".repeat(37); // padding to the frame's fixed tail length
+        s += "C4C5C6C7";
+        s
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -424,5 +520,46 @@ mod tests {
         assert!(hex.ends_with("F4F5F6F7"));
         // "F01F0000" (8) + 15 zero bytes (30) + marker (2) + count (4) = 44.
         assert_eq!(&hex[44..44 + 12], "00000000C801"); // x=0000 y=0000 color=C8(200) tag=01
+    }
+
+    // These four match the app's own literal strings in `onOffChange`
+    // exactly (see pages/main/main.js), not just our derived encoding.
+    #[test]
+    fn power_legacy_matches_the_app_literal_strings() {
+        assert_eq!(
+            PowerCommand { on: false, new_type: false }.to_hex_string(),
+            "B0B1B2B300B4B5B6B7"
+        );
+        assert_eq!(
+            PowerCommand { on: true, new_type: false }.to_hex_string(),
+            "B0B1B2B3FFB4B5B6B7"
+        );
+    }
+
+    #[test]
+    fn power_new_type_matches_the_app_literal_strings() {
+        assert_eq!(
+            PowerCommand { on: false, new_type: true }.to_hex_string(),
+            "B0B1B2B30000000000000000B4B5B6B7"
+        );
+        assert_eq!(
+            PowerCommand { on: true, new_type: true }.to_hex_string(),
+            "B0B1B2B3FF00000000000000B4B5B6B7"
+        );
+    }
+
+    #[test]
+    fn mode_frame_uses_the_c0c1c2c3_sentinels_and_expected_total_length() {
+        let hex = ModeCommand { cur_mode: 0 }.to_hex_string();
+        assert!(hex.starts_with("C0C1C2C3"));
+        assert!(hex.ends_with("C4C5C6C7"));
+        // 4 (header) + 60 (payload, see struct docs) + 4 (trailer) = 68 bytes.
+        assert_eq!(hex.len(), 136);
+    }
+
+    #[test]
+    fn mode_frame_puts_cur_mode_right_after_the_header() {
+        let hex = ModeCommand { cur_mode: 5 }.to_hex_string();
+        assert_eq!(&hex[8..10], "05");
     }
 }

@@ -8,7 +8,7 @@ use btleplug::api::WriteType;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 
-use protocol::{ColorMode, DrawCommand, DrawPoint, ExtendedSettings, LightChannel, Settings};
+use protocol::{ColorMode, DrawCommand, DrawPoint, ExtendedSettings, LightChannel, ModeCommand, PowerCommand, Settings};
 
 #[derive(Parser)]
 #[command(
@@ -61,9 +61,11 @@ enum Command {
         to_x: i16,
         #[arg(long, allow_hyphen_values = true)]
         to_y: i16,
-        /// Palette color index. 0..=15 in the default (legacy) encoding;
-        /// full 0..=255 range under --cmd-new-type.
-        #[arg(long, default_value_t = 0)]
+        /// Palette color index. Confirmed on hardware: 1=red, 2=green,
+        /// 3=blue. 0..=15 range in the default (legacy) encoding; full
+        /// 0..=255 range under --cmd-new-type. (0 itself isn't a real
+        /// color — it's what the shape-start marker point uses.)
+        #[arg(long, default_value_t = 1)]
         color: u8,
         /// Use the alternate "cmdNewType" frame/point encoding (see
         /// DrawCommand's docs) instead of the legacy one tried first.
@@ -74,6 +76,38 @@ enum Command {
         #[arg(long)]
         response: bool,
     },
+    /// Turn the device on or off — a distinct command from `set`, traced
+    /// from the app's `onOffChange`. Not yet tried on hardware.
+    Power {
+        #[arg(value_enum)]
+        state: PowerArg,
+        /// Use the alternate "cmdNewType" frame encoding (see
+        /// PowerCommand's docs) instead of the legacy one tried first.
+        #[arg(long)]
+        cmd_new_type: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        response: bool,
+    },
+    /// Set the device's operating mode (dmx/draw/line/etc. on its on-screen
+    /// "mode set"). The mapping from this number to a specific mode name
+    /// is NOT known yet — see ModeCommand's docs. Try values 0..=12 and
+    /// watch the device's screen to build that mapping.
+    Mode {
+        #[arg(value_parser = clap::value_parser!(u8).range(0..=12))]
+        cur_mode: u8,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        response: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PowerArg {
+    On,
+    Off,
 }
 
 #[derive(clap::Args)]
@@ -169,6 +203,10 @@ async fn main() -> Result<()> {
         Command::DrawLine { from_x, from_y, to_x, to_y, color, cmd_new_type, dry_run, response } => {
             run_draw_line(cli.scan_seconds, from_x, from_y, to_x, to_y, color, cmd_new_type, dry_run, response).await
         }
+        Command::Power { state, cmd_new_type, dry_run, response } => {
+            run_power(cli.scan_seconds, matches!(state, PowerArg::On), cmd_new_type, dry_run, response).await
+        }
+        Command::Mode { cur_mode, dry_run, response } => run_mode(cli.scan_seconds, cur_mode, dry_run, response).await,
     }
 }
 
@@ -207,7 +245,7 @@ async fn run_inspect(scan_seconds: u64) -> Result<()> {
             }
         }
     }
-    println!("Handshake query response ({} notifications within 1.5s):", report.notifications.len());
+    println!("Handshake query response ({} notifications, up to 3 retries):", report.notifications.len());
     for (uuid, value) in &report.notifications {
         let hex: String = value.iter().map(|b| format!("{b:02X}")).collect();
         println!("  notify {uuid}: {hex}");
@@ -262,9 +300,9 @@ async fn run_set(scan_seconds: u64, args: SetArgs) -> Result<()> {
     dev.subscribe_all_notifications().await?;
     let mut notifications = dev.notifications().await?;
 
-    println!("Connected to {}. Sending handshake query (E0E1E2E3E4E5E6E7)...", dev.name);
-    dev.send_as(&device::QUERY_FRAME, write_type).await?;
-    report_notifications(&mut notifications, Duration::from_millis(1500)).await;
+    println!("Connected to {}. Sending handshake query (retrying up to 3x, 3s apart)...", dev.name);
+    let query_responses = dev.query_with_retries(&mut notifications, write_type).await?;
+    print_notifications(&query_responses);
 
     println!("Sending ({write_type:?}): {hex}");
     dev.send_as(&settings.to_bytes(), write_type).await?;
@@ -302,6 +340,17 @@ async fn report_notifications(
     }
 }
 
+fn print_notifications(notifications: &[btleplug::api::ValueNotification]) {
+    if notifications.is_empty() {
+        println!("  (no notifications)");
+        return;
+    }
+    for n in notifications {
+        let hex: String = n.value.iter().map(|b| format!("{b:02X}")).collect();
+        println!("  notify {}: {hex}", n.uuid);
+    }
+}
+
 async fn run_raw(scan_seconds: u64, hex: String, dry_run: bool, response: bool) -> Result<()> {
     let hex = hex.trim().to_uppercase();
     if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -324,9 +373,9 @@ async fn run_raw(scan_seconds: u64, hex: String, dry_run: bool, response: bool) 
     dev.subscribe_all_notifications().await?;
     let mut notifications = dev.notifications().await?;
 
-    println!("Connected to {}. Sending handshake query (E0E1E2E3E4E5E6E7)...", dev.name);
-    dev.send_as(&device::QUERY_FRAME, write_type).await?;
-    report_notifications(&mut notifications, Duration::from_millis(1500)).await;
+    println!("Connected to {}. Sending handshake query (retrying up to 3x, 3s apart)...", dev.name);
+    let query_responses = dev.query_with_retries(&mut notifications, write_type).await?;
+    print_notifications(&query_responses);
 
     println!("Sending ({write_type:?}) {} bytes: {hex}", bytes.len());
     dev.send_as(&bytes, write_type).await?;
@@ -352,8 +401,8 @@ async fn run_draw_line(
     }
     let cmd = DrawCommand {
         points: vec![
-            DrawPoint { x: from_x, y: from_y, color, tag: 1 }, // move (laser off)
-            DrawPoint { x: to_x, y: to_y, color, tag: 0 },     // draw (laser on)
+            DrawPoint { x: from_x, y: from_y, color: 0, tag: 2 }, // shape-start marker
+            DrawPoint { x: to_x, y: to_y, color, tag: 3 },        // outline point, also the shape's last
         ],
         new_type: cmd_new_type,
     };
@@ -370,11 +419,65 @@ async fn run_draw_line(
     dev.subscribe_all_notifications().await?;
     let mut notifications = dev.notifications().await?;
 
-    println!("Connected to {}. Sending handshake query (E0E1E2E3E4E5E6E7)...", dev.name);
-    dev.send_as(&device::QUERY_FRAME, write_type).await?;
-    report_notifications(&mut notifications, Duration::from_millis(1500)).await;
+    println!("Connected to {}. Sending handshake query (retrying up to 3x, 3s apart)...", dev.name);
+    let query_responses = dev.query_with_retries(&mut notifications, write_type).await?;
+    print_notifications(&query_responses);
 
     println!("Sending draw-line ({write_type:?}): {hex}");
+    dev.send_as(&cmd.to_bytes(), write_type).await?;
+    report_notifications(&mut notifications, Duration::from_millis(1000)).await;
+    dev.disconnect().await?;
+    println!("Done.");
+    Ok(())
+}
+
+async fn run_power(scan_seconds: u64, on: bool, cmd_new_type: bool, dry_run: bool, response: bool) -> Result<()> {
+    let cmd = PowerCommand { on, new_type: cmd_new_type };
+    let hex = cmd.to_hex_string();
+
+    if dry_run {
+        println!("{hex}");
+        return Ok(());
+    }
+
+    println!("Connecting to {}* (up to {scan_seconds}s)...", device::DEVICE_NAME_PREFIX);
+    let dev = device::connect_first(scan_seconds).await?;
+    let write_type = if response { WriteType::WithResponse } else { WriteType::WithoutResponse };
+    dev.subscribe_all_notifications().await?;
+    let mut notifications = dev.notifications().await?;
+
+    println!("Connected to {}. Sending handshake query (retrying up to 3x, 3s apart)...", dev.name);
+    let query_responses = dev.query_with_retries(&mut notifications, write_type).await?;
+    print_notifications(&query_responses);
+
+    println!("Sending power {} ({write_type:?}): {hex}", if on { "on" } else { "off" });
+    dev.send_as(&cmd.to_bytes(), write_type).await?;
+    report_notifications(&mut notifications, Duration::from_millis(1000)).await;
+    dev.disconnect().await?;
+    println!("Done.");
+    Ok(())
+}
+
+async fn run_mode(scan_seconds: u64, cur_mode: u8, dry_run: bool, response: bool) -> Result<()> {
+    let cmd = ModeCommand { cur_mode };
+    let hex = cmd.to_hex_string();
+
+    if dry_run {
+        println!("{hex}");
+        return Ok(());
+    }
+
+    println!("Connecting to {}* (up to {scan_seconds}s)...", device::DEVICE_NAME_PREFIX);
+    let dev = device::connect_first(scan_seconds).await?;
+    let write_type = if response { WriteType::WithResponse } else { WriteType::WithoutResponse };
+    dev.subscribe_all_notifications().await?;
+    let mut notifications = dev.notifications().await?;
+
+    println!("Connected to {}. Sending handshake query (retrying up to 3x, 3s apart)...", dev.name);
+    let query_responses = dev.query_with_retries(&mut notifications, write_type).await?;
+    print_notifications(&query_responses);
+
+    println!("Sending mode {cur_mode} ({write_type:?}): {hex}");
     dev.send_as(&cmd.to_bytes(), write_type).await?;
     report_notifications(&mut notifications, Duration::from_millis(1000)).await;
     dev.disconnect().await?;
